@@ -599,6 +599,8 @@ if (window.top !== window.self) { try { window.top.location.replace(window.self.
   .nid-verify input{width:210px;max-width:100%;height:32px;padding:4px 8px;border:1px solid var(--border);border-radius:8px;}
   .nid-verify-out.ok{color:#1b5e20;font-weight:700;}
   .nid-verify-out.bad{color:var(--danger);font-weight:700;}
+  .audit-grid{display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:16px;}
+  @media(min-width:880px){.audit-grid{grid-template-columns:1fr 1fr;}}
   .login-notice{background:#E8F5EE;border:1px solid #bfe3cd;color:#065C35;border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:14px;}
   .login-home-link{position:absolute;top:16px;left:16px;z-index:2;text-decoration:none;font-size:13.5px;font-weight:600;color:var(--primary-dark);background:rgba(255,255,255,.85);border:1px solid var(--border);padding:7px 12px;border-radius:10px;}
   @media(prefers-reduced-motion:reduce){#homeScreen *{animation:none !important;transition:none !important;scroll-behavior:auto !important;}}
@@ -1373,29 +1375,318 @@ async function getFarmerReceivedForCropFertilizer(nid, cropLimitId, fertilizer) 
   } catch (e) { return 0; }
 }
 
-/* ---- Dealer stock (flat number per fertilizer: dealers/{id}/stock) ----
-   (feature) Was a one-time get() fetched only at login, then re-fetched
-   whenever the dealer navigated to "বিতরণ করুন"/"ব্যাক ডেটা" (a mitigation
-   added earlier). That still had a gap: if the dealer stayed on the
-   distribute page for a while and an admin topped up their stock in the
-   meantime, the number stayed stale until the dealer navigated away and
-   back. This now uses a Firebase REALTIME LISTENER (onValue) instead — any
-   change to dealers/{id}/stock (admin edits it, or this same dealer's own
-   distribution deducts it from another tab/device) pushes to
-   state.dealerStock and re-renders instantly, with no navigation needed.
-   Still a single small, direct-path subscription — not a table scan. */
+/* ---------------- TWO-LEVEL stock management (rebuilt) ----------------
+   LEVEL 1 — central/upazila stock, held by Main Admin/UNO:
+     adminStock/{fertilizer} = { received, allocated, available }
+     available = received - allocated   (allocated = total ever transferred to dealers)
+
+   LEVEL 2 — per-dealer stock:
+     dealerStock/{dealerId}/{fertilizer} = { received, distributed, available }
+     available = received - distributed
+
+   Audit ledgers (append-only, never the source of truth for current stock —
+   current stock always lives in adminStock/dealerStock above; history is
+   ONLY ever read for display, never summed to derive a balance):
+     stockHistory/{dealerId}/{historyId} = { dealerId, dealerName, fertilizer,
+       transactionType, quantity, previousStock, newStock, addedBy,
+       addedByName, note, date, createdAt }
+       transactionType ∈ STOCK_TRANSFER_IN (admin→dealer) | DISTRIBUTION
+       (dealer→farmer) | STOCK_ADJUSTMENT (delete-record stock restore)
+     adminStockHistory/{historyId} = { fertilizer, transactionType, quantity,
+       previousStock, newStock, addedBy, addedByName, note, date, createdAt,
+       dealerId?, dealerName? }
+       transactionType ∈ CENTRAL_STOCK_RECEIVED (government/supplier receipt)
+       | STOCK_TRANSFER_OUT (admin→dealer, mirrors the dealer's TRANSFER_IN)
+
+   stockHistory is nested PER DEALER (not a flat node with .indexOn) so a
+   dealer's own history is a plain key-ordered read — no index, no
+   orderByChild/equalTo query, and it can never grow into one giant
+   all-dealers collection. adminStock/adminStockHistory are both tiny
+   (bounded by fertilizer-count) so they load in full, same reasoning as
+   `dealers`/`dealerStock` already use elsewhere in this file.
+
+   BOTH adminStock and dealerStock are mutated ONLY through the helpers
+   below (transferAdminStockToDealer, reserveDealerStock, restoreDealerStock,
+   receiveCentralStock) — never with an ad-hoc get()→calculate→set() anywhere
+   else in this file. See those functions for the exact atomicity guarantees. */
+const STOCK_TX_TYPES = {
+  STOCK_TRANSFER_IN: 'স্টক ট্রান্সফার (অ্যাডমিন থেকে)', DISTRIBUTION: 'বিতরণ (বিয়োগ)', STOCK_ADJUSTMENT: 'সমন্বয়',
+  CENTRAL_STOCK_RECEIVED: 'কেন্দ্রীয় স্টক গ্রহণ', STOCK_TRANSFER_OUT: 'স্টক ট্রান্সফার (ডিলারকে)',
+  CENTRAL_STOCK_ADJUSTMENT: 'কেন্দ্রীয় স্টক সমন্বয়',
+  FARMER_CARD_DISTRIBUTION: 'কৃষক কার্ড বিতরণ (বিয়োগ)',
+};
+// Signed KG effect of a ledger entry on the stock it belongs to. Adjustment
+// entries carry previousStock/newStock, so the sign comes from those (no
+// new field or type needed on the dealer ledger — see adjustDealerStockDirect).
+function ledgerSignedQty(e) {
+  const q = Number(e && e.quantity) || 0;
+  if (!e) return 0;
+  if (e.transactionType === 'DISTRIBUTION' || e.transactionType === 'STOCK_TRANSFER_OUT' || e.transactionType === 'FARMER_CARD_DISTRIBUTION') return -q;
+  if (e.transactionType === 'STOCK_ADJUSTMENT' || e.transactionType === 'CENTRAL_STOCK_ADJUSTMENT') {
+    const p = Number(e.previousStock), n = Number(e.newStock);
+    if (isFinite(p) && isFinite(n) && e.previousStock !== undefined && e.newStock !== undefined && e.previousStock !== null && e.newStock !== null) return n - p;
+    return q;
+  }
+  return q;
+}
+function ledgerQtyLabel(e) {
+  const v = ledgerSignedQty(e);
+  if (e && (e.transactionType === 'STOCK_ADJUSTMENT' || e.transactionType === 'CENTRAL_STOCK_ADJUSTMENT')) return `${v >= 0 ? '+' : '−'}${kgFmt(Math.abs(v))} কেজি`;
+  return `${kgFmt(Number(e && e.quantity) || 0)} কেজি`;
+}
+function emptyStockRow() { return { received: 0, distributed: 0, available: 0 }; }
+function emptyAdminStockRow() { return { received: 0, allocated: 0, available: 0 }; }
+// Central helper — EVERY place in this file that reads a dealerStock row
+// goes through this, so "received/distributed/available default to 0 for a
+// missing/partial row" is defined exactly once.
+function normalizeStockRow(row) {
+  return { received: Number(row && row.received) || 0, distributed: Number(row && row.distributed) || 0, available: Number(row && row.available) || 0 };
+}
+function normalizeAdminStockRow(row) {
+  return { received: Number(row && row.received) || 0, allocated: Number(row && row.allocated) || 0, available: Number(row && row.available) || 0 };
+}
+// ---- Cache-warmup wrapper for Firebase transactions on adminStock/dealerStock ----
+// runTransaction()'s updater function can be invoked with `current = null` on
+// its VERY FIRST call whenever the SDK has no locally-cached value for that
+// exact path — true here, since adminStock/dealerStock paths are only ever
+// read elsewhere in this file via one-off get() calls, never a persistent
+// listener. A transaction whose updater ALWAYS returns a new value
+// self-corrects: Firebase silently retries it against the true server value
+// before actually committing. But a transaction that can explicitly ABORT
+// (`return undefined`) on a business check — e.g. "quantity > available" —
+// is NOT retried after an abort; Firebase treats that as a final, deliberate
+// decision not to write. So a null-derived "available: 0" on the first pass
+// can trigger a FALSE "insufficient stock" rejection even though the true
+// server-side stock is ample (this was the exact root cause of dealers/admin
+// seeing "অপর্যাপ্ত স্টক" while the displayed "available" figure — fetched
+// separately, after the abort — showed plenty of stock).
+// Fix: warm the SDK's local cache with a plain get() on the exact same path
+// immediately before the transaction, and — defense in depth — retry once
+// (re-warm + re-run) if the first attempt still reports committed:false,
+// before accepting that as a real, final result. A genuinely-insufficient
+// case still aborts identically on the retry, so no incorrect writes can
+// ever result from this wrapper — it only removes false negatives.
+async function runStockTransactionWithCacheWarmup(stockRef, updater) {
+  await get(stockRef); // warm the local cache with the true current server value
+  let result = await runTransaction(stockRef, updater);
+  if (!result.committed) {
+    // Either a genuine abort (real insufficient stock) or a second
+    // cache-staleness miss (e.g. a concurrent write just landed) — re-warm
+    // and try exactly once more before trusting the result as final.
+    await get(stockRef);
+    result = await runTransaction(stockRef, updater);
+  }
+  return result;
+}
+function validateStockQuantity(qty) { return typeof qty === 'number' && isFinite(qty) && qty > 0; }
+// Best-effort audit-log append — the numeric mutation this describes has
+// ALREADY committed by the time this is called (see every caller below), so
+// a failure here never blocks or rolls back the real stock change; it just
+// means this one ledger entry is missing (logged to systemLogs by the
+// caller so it's still visible to Main Admin).
+function recordStockHistory(dealerId, entry) {
+  return dbPush(`stockHistory/${dealerId}`, { dealerId, addedBy: realUser().uid, addedByName: realUser().name || '', createdAt: Date.now(), ...entry });
+}
+function recordAdminStockHistory(entry) {
+  return dbPush('adminStockHistory', { addedBy: realUser().uid, addedByName: realUser().name || '', createdAt: Date.now(), ...entry });
+}
+// Scans only the already-loaded (bounded, small) adminStock/dealerStock
+// nodes — never `distributions` — for a formula violation. Legacy/negative
+// data is surfaced here, never silently auto-corrected (see renderAdminDashboard).
+function computeStockIntegrityIssues() {
+  const issues = [];
+  const EPS = 0.001;
+  FERTILIZERS.forEach(f => {
+    const a = normalizeAdminStockRow(state.adminStock && state.adminStock[f.v]);
+    if (a.available < -EPS || Math.abs((a.received - a.allocated) - a.available) > EPS) {
+      issues.push({ scope: 'admin', fertilizer: f.v, row: a });
+    }
+  });
+  (state.dealers || []).forEach(d => {
+    const dealerRow = (state.allDealerStock && state.allDealerStock[d.id]) || {};
+    FERTILIZERS.forEach(f => {
+      const s = normalizeStockRow(dealerRow[f.v]);
+      if (s.available < -EPS || Math.abs((s.received - s.distributed) - s.available) > EPS) {
+        issues.push({ scope: 'dealer', dealerId: d.id, dealerName: d.name, fertilizer: f.v, row: s });
+      }
+    });
+  });
+  return issues;
+}
+// ---- Dealer→Farmer stock reservation — ONE Firebase transaction across the
+// WHOLE dealerStock/{dealerId} node (every fertilizer this dealer has, not
+// just the ones in `items`), not one transaction per fertilizer. This is
+// what makes a multi-fertilizer submission genuinely all-or-nothing: the
+// updater function validates EVERY item's availability FIRST — if even one
+// item is short, it returns undefined and Firebase commits NOTHING for ANY
+// item in this submission. Only once every item is confirmed sufficient
+// does it deduct all of them, in that same pass. A concurrent submission by
+// the SAME dealer (double-click, two tabs) is automatically retried by
+// Firebase against the freshly-committed data, so the second one correctly
+// re-validates against the reduced stock — this transaction is the actual
+// final authority, not just the disabled-submit-button UI guard.
+async function reserveDealerStock(dealerId, items) {
+  const stockRef = ref(db, `dealerStock/${dealerId}`);
+  let shortfall = null;
+  let before = {};
+  const txResult = await runStockTransactionWithCacheWarmup(stockRef, (current) => {
+    shortfall = null;
+    before = {};
+    const node = Object.assign({}, current || {});
+    for (const it of items) {
+      const row = normalizeStockRow(node[it.fertilizer]);
+      if (it.quantity > row.available) { shortfall = { fertilizer: it.fertilizer, available: row.available }; return undefined; } // abort — nothing written for ANY item
+    }
+    for (const it of items) {
+      const row = normalizeStockRow(node[it.fertilizer]);
+      before[it.fertilizer] = row.available;
+      node[it.fertilizer] = { received: row.received, distributed: row.distributed + it.quantity, available: row.available - it.quantity };
+    }
+    return node;
+  });
+  return { committed: txResult.committed, shortfall, before };
+}
+// Rollback counterpart — used when Phase 2 (the distribution record write)
+// fails AFTER reserveDealerStock already committed, and when Main Admin
+// deletes a distribution record after the fact (data-entry correction, see
+// restoreDealerStockForDeletedRecord). Symmetric single transaction on the
+// same whole-node path, so it can never race against a concurrent
+// distribution/transfer touching a different fertilizer for this dealer.
+async function restoreDealerStock(dealerId, items) {
+  if (!items || !items.length) return;
+  const stockRef = ref(db, `dealerStock/${dealerId}`);
+  await runStockTransactionWithCacheWarmup(stockRef, (current) => {
+    const node = Object.assign({}, current || {});
+    for (const it of items) {
+      const row = normalizeStockRow(node[it.fertilizer]);
+      node[it.fertilizer] = { received: row.received, distributed: Math.max(0, row.distributed - it.quantity), available: row.available + it.quantity };
+    }
+    return node;
+  });
+}
+
+/* ---------------- realtime stock listeners (live, no manual refresh) ----------------
+   Firebase Security Rules apply identically to a one-time get() and a live
+   onValue() listener — same .read permission, same path — so switching these
+   three views from "fetch once when the page opens" to "stay subscribed and
+   update the instant Firebase pushes a change" needed NO Firebase Rules
+   change at all.
+
+   Two different subscription lifetimes, matched to how big/expensive each
+   path is (same reasoning the rest of this file already uses for
+   eager-vs-lazy loading):
+     - myStock (dealerStock/{uid}) and adminStock are both tiny, per-session,
+       bounded nodes — subscribed once at login (see loadAllData) and kept
+       alive for the WHOLE session, exactly like Dewanganj's
+       subscribeDealerStock/unsubscribeDealerStock pattern. This is what
+       makes a Transfer Stock action (or another admin's edit) show up on a
+       dealer's "আমার স্টক" page — or on the Main Admin's own dashboard —
+       instantly, with no navigation and no manual refresh.
+     - dealerStock (the ADMIN-WIDE node, every dealer's stock) scales with
+       dealer count, so it stays view-scoped: subscribed only while the
+       "স্টক ব্যবস্থাপনা" page is open, unsubscribed the moment the admin
+       navigates away (see navigateTo) — never a session-long listener. This
+       preserves the existing lazy-load cost design for that one node while
+       still making the Stock Management page itself update live while open. */
+let adminStockUnsub = null;
+function subscribeAdminStock() {
+  unsubscribeAdminStock();
+  if (!state.user || (state.user.role !== 'admin' && state.user.role !== 'uno')) return;
+  const stockRef = ref(db, 'adminStock');
+  adminStockUnsub = onValue(stockRef, (snap) => {
+    state.adminStock = snap.exists() ? { ...snap.val() } : {};
+    if (state.user && (currentView === 'dashboard' || currentView === 'dealerStock')) renderCurrentView();
+  }, () => { /* keep last-known value on a hiccup */ });
+}
+function unsubscribeAdminStock() {
+  if (adminStockUnsub) { try { adminStockUnsub(); } catch (e) { /* ignore */ } adminStockUnsub = null; }
+}
+let dealerStockAdminUnsub = null;
+function subscribeDealerStockAdmin() {
+  unsubscribeDealerStockAdmin();
+  state.allDealerStockLoading = true; state.allDealerStockError = null;
+  renderCurrentView();
+  const stockRef = ref(db, 'dealerStock');
+  dealerStockAdminUnsub = onValue(stockRef, (snap) => {
+    state.allDealerStock = snap.exists() ? { ...snap.val() } : {};
+    state.allDealerStockLoading = false;
+    if (state.user && (currentView === 'dealerStock' || currentView === 'officeReport')) renderCurrentView();
+  }, (e) => {
+    state.allDealerStockError = (e && e.message) || 'স্টক তথ্য লোড করা যায়নি — নেটওয়ার্ক বা Firebase Rules চেক করুন';
+    state.allDealerStockLoading = false;
+    renderCurrentView();
+  });
+}
+function unsubscribeDealerStockAdmin() {
+  if (dealerStockAdminUnsub) { try { dealerStockAdminUnsub(); } catch (e) { /* ignore */ } dealerStockAdminUnsub = null; }
+}
+
+/* ---- helpers used by the stock / dealer-audit pages (ported from FDMS Bakshiganj) ---- */
+// Official DD/MM/YYYY display (audit screens).
+function ddmmyyyy(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateStr || ''));
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : (dateStr ? String(dateStr) : '-');
+}
+// Firebase push-id prefix for a millisecond timestamp: orderByKey()+startAt(prefix)
+// is an index-free "created at or after t" range on stockHistory/{dealer}.
+const PUSH_CHARS = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
+function pushKeyPrefixForTime(ms) {
+  let now = Math.max(0, Math.floor(ms)); const chars = new Array(8);
+  for (let i = 7; i >= 0; i--) { chars[i] = PUSH_CHARS.charAt(now % 64); now = Math.floor(now / 64); }
+  return chars.join('');
+}
+async function iterateDistScope(sc, onRows, onProgress, isCancelled) {
+  if (sc.kind === 'memory') { onRows(sc.rows); if (onProgress) onProgress(sc.rows.length, sc.rows.length); return; }
+  const BATCH = 1000;
+  let cursor = null, scanned = 0, matched = 0;
+  for (;;) {
+    if (isCancelled && isCancelled()) throw Object.assign(new Error('বাতিল করা হয়েছে'), { code: 'CANCELLED' });
+    const desc = snapToOrderedArray(await get(buildOlderQuery(sc, cursor, BATCH))).reverse();
+    if (!desc.length) break;
+    scanned += desc.length;
+    const rows = sc.predicate ? desc.filter(sc.predicate) : desc;
+    matched += rows.length;
+    if (rows.length) onRows(rows);
+    if (onProgress) onProgress(matched, scanned);
+    if (desc.length < BATCH) break;
+    cursor = distCursorOf(sc, desc[desc.length - 1]);
+  }
+}
+// Full bulk export for the dedicated "ডেটা এক্সপোর্ট" page ONLY — batched
+function dealersForUnion(union) {
+  const list = union ? (state.dealers || []).filter(d => d.union === union) : (state.dealers || []);
+  return list.slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'bn'));
+}
+
+function csvEscapeCell(v) { const s = String(v === undefined || v === null ? '' : v); return /[",\n\r]/.test(s) ? '"' + s.replaceAll('"', '""') + '"' : s; }
+function csvLines(rows) { return rows.map(r => r.map(csvEscapeCell).join(',')).join('\n'); }
+// Distribution rows for the dealer-audit CSV — same columns as "ডেটা এক্সপোর্ট" (no NID: Debiganj never stores it).
+const DISTRIBUTION_CSV_HEADERS = ['#', 'কৃষক', 'পিতার নাম', 'মোবাইল', 'সার', 'পরিমাণ(কেজি)', 'ডিলার', 'ইউনিয়ন', 'গ্রাম', 'ঠিকানা', 'জমি(শতাংশ)', 'মৌজা', 'দাগ নম্বর', 'খতিয়ান', 'ফসল', 'তারিখ', 'বিতরণ আইডি'];
+function buildDistributionCsvRows(list, offset) {
+  const base = Number(offset) || 0;
+  return list.map((r, i) => [base + i + 1, r.farmerName || '', r.fatherName || '-', csvPhone(r.mobile), fertilizerLabel(r.fertilizer), r.quantity ?? '', r.dealerName || '', r.union || '', r.village || '-', r.address || '-', r.landArea ?? '-', r.mouza || '-', r.dagNumber || '-', r.khatianNumber || '-', cropLabel(r) || '-', csvDate(r.date), r.id || '']);
+}
+
+/* ---- the dealer's OWN stock: live listener on dealerStock/{dealerId} ----
+   state.myStock      = raw rows {fert: {received, distributed, available}} (আমার স্টক page)
+   state.dealerStock  = {fert: available} — what the distribution form, the
+                        stock pills and the clamps read (getDealerCurrentStock).
+   Both come from the same snapshot, so they can never disagree. */
 let dealerStockUnsub = null;
 function subscribeDealerStock(dealerId) {
   unsubscribeDealerStock();
-  const stockRef = ref(db, `dealers/${dealerId}/stock`);
+  state.myStockLoading = true;
+  const stockRef = ref(db, `dealerStock/${dealerId}`);
   dealerStockUnsub = onValue(stockRef, (snap) => {
-    state.dealerStock = snap.exists() ? { ...snap.val() } : {};
-    // An open distribution form is NOT re-rendered (that wiped a half-filled
-    // form and the farmer lookup on every stock change — including the
-    // deduction in the middle of a save); only its stock strip is refreshed.
+    const raw = snap.exists() ? { ...snap.val() } : {};
+    state.myStock = raw;
+    state.myStockLoading = false;
+    state.dealerStock = Object.fromEntries(FERTILIZERS.map(f => [f.v, normalizeStockRow(raw[f.v]).available]));
+    // An open distribution form is NOT re-rendered (that would wipe a half-filled
+    // form and the farmer lookup); only its stock strip is refreshed.
     if ((currentView === 'distribute' || currentView === 'backData') && document.getElementById('distributionForm')) { refreshDistStockStrip(); return; }
-    if (currentView === 'distribute' || currentView === 'backData' || currentView === 'dashboard') renderCurrentView();
-  }, () => { /* permission/connection hiccup — keep last-known value rather than wiping it */ });
+    if (currentView === 'distribute' || currentView === 'backData' || currentView === 'dashboard' || currentView === 'myStock') renderCurrentView();
+  }, () => { state.myStockLoading = false; /* permission/connection hiccup — keep last-known value */ });
 }
 function distStockPillsHtml() {
   return FERTILIZERS.map(f => {
@@ -1423,6 +1714,18 @@ const LOG_CATEGORIES = {
 
 const state = {
   user: null,
+  // two-level stock (FDMS Bakshiganj model)
+  adminStock: {},          // adminStock/{fert} — live for admin/UNO sessions
+  allDealerStock: {},      // dealerStock (every dealer) — live only while স্টক ব্যবস্থাপনা / অফিস রিপোর্ট is open
+  dealerStockLoading: false,
+  dealerStockError: null,
+  stockSearch: '',
+  myStock: null,           // dealerStock/{own uid} rows — dealer session
+  myStockLoading: false,
+  stockHistoryDealerId: null,
+  stockHistoryRows: [],
+  stockHistoryLoading: false,
+  audit: null,             // ডিলার অডিট page (emptyAuditState)
   dealers: [],
   unos: [],
   distributions: [],
@@ -1442,9 +1745,6 @@ const state = {
   developers: [],
   cropLimits: [],          // {id, name, kgPerBigha, status} — admin-configured
   dealerStock: {},         // {fertilizerName: qty} — CURRENT LOGGED-IN dealer's own stock (dealers/{uid}/stock in Firebase)
-  allocationSearch: '',    // client-side name/union filter on the small (per-dealer) Allocation table — NOT applied to the distributions table
-  allocationUnion: '',     // v10.11 বরাদ্দ: union filter (dealers/{uid}.union)
-  stockReport: null,       // v10.11 বরাদ্দ: date-wise dealer stock & allocation report
   // ---- v8-1 additions ----
   saaos: [],               // Main Admin: উপসহকারী (SAAO) profiles from saao/{uid}
   saaoDealers: [],         // SAAO: own assigned dealer profiles (saaoDealers/{uid} → dealers/{id})
@@ -3223,7 +3523,7 @@ function runFullRecount({ trigger = 'manual', background = false } = {}) {
 /* ---- Dealer dashboard data (dealer-scoped reads only, bounded) ----
    • dashboardStats/dealerStats/{uid}   — this dealer's own counters
    • distributions (dealerId == uid)    — the latest 50 records (indexed, limitToLast)
-   • dealerSales/{uid}/byFert           — cumulative kg per fertilizer
+   • dealerStock/{uid}/{fert}.distributed — cumulative kg per fertilizer (live)
    Totals are EXACT and never derived from the latest-50 page:
      < 50 own records          → those rows ARE the complete set
      verified _meta + counters → own counters (O(1))
@@ -3242,7 +3542,7 @@ async function loadDealerDashboardData() {
     const [own, snap, sales, M] = await Promise.all([
       dbGet(`dashboardStats/dealerStats/${statsKeyPart(uid)}`).catch(() => null),
       recentQ(DEALER_RECENT_LIMIT),
-      dbGet(`dealerSales/${uid}/byFert`).catch(() => null), // optional — not every Rules set exposes it
+      Promise.resolve(null), // per-fertilizer kg given out now comes from dealerStock/{uid}.distributed (live)
       readStatsMeta(),
     ]);
     const rows = objToArray(snap.exists() ? snap.val() : null).sort(distRowDescCompare);
@@ -3366,11 +3666,23 @@ function statsDeltaPaths(records, sign) { return statsIncrements(statsDeltaRaw(r
    path (handleAdminDeleteDist). */
 async function restoreDealerStockForDeletedRecord(record) {
   if (!record || !record.dealerId || !record.fertilizer) return;
-  const qty = Number(record.quantity) || 0;
+  const qty = parseFloat(normalizeBanglaDigits(record.quantity)) || 0;
   if (qty <= 0) return;
   try {
-    await runTransaction(ref(db, `dealers/${record.dealerId}/stock/${record.fertilizer}`), (current) => (Number(current) || 0) + qty);
-  } catch (e) { /* best-effort — the distribution delete itself must not be blocked by this */ }
+    // Same restoreDealerStock() transaction as the failed-save rollback.
+    await restoreDealerStock(record.dealerId, [{ fertilizer: record.fertilizer, quantity: qty }]);
+    let previousStock = 0, newStock = 0;
+    try {
+      const fresh = normalizeStockRow(await dbGet(`dealerStock/${record.dealerId}/${record.fertilizer}`));
+      newStock = fresh.available;
+      previousStock = round2(newStock - qty);
+    } catch (e) { /* display values only — the stock change already committed */ }
+    await recordStockHistory(record.dealerId, {
+      dealerName: record.dealerName || '', fertilizer: record.fertilizer,
+      transactionType: 'STOCK_ADJUSTMENT', quantity: qty, previousStock, newStock,
+      note: `রেকর্ড মুছে ফেলায় স্টক ফেরত — কৃষক: ${record.farmerName || '-'}`, date: todayStr(), distId: record.id || '',
+    });
+  } catch (e) { writeSystemLog('error', 'stock_restore_failed', (e && e.message) || 'unknown'); /* the delete itself is never blocked by this */ }
 }
 function applyLocalDashboardStats(records) {
   const stats = mergeDashboardStats(state.dashboardStats);
@@ -4546,6 +4858,7 @@ async function loadAllData() {
       state.unos = [];
       state.developers = [];
       resetLogPager();
+      if (state.user.role === 'admin' || state.user.role === 'uno') subscribeAdminStock(); // central stock — live for the session
       if (state.user.role === 'admin') {
         dbGet('uno').then(unoObj => { state.unos = objToArray(unoObj); }).catch(() => { state.unos = []; });
         dbGet('developers').then(devObj => { state.developers = objToArray(devObj); }).catch(() => { state.developers = []; });
@@ -4679,6 +4992,8 @@ async function readDealerForView(dealerId) {
 // Everything that belongs to ONE dealer session: cleared on enter and on exit.
 function clearDealerScopedState() {
   unsubscribeDealerStock();
+  unsubscribeAdminStock(); unsubscribeDealerStockAdmin(); // re-subscribed by loadAllData for whoever the session is now
+  state.myStock = null; state.allDealerStock = {};
   pendingDistribution = null;
   state.dealerDash = null; state.dealerStock = {}; state.distributions = []; state.farmerLookup = null; state.farmerSearchResults = null;
   state.filters = { union: '', dealer: '', fertilizer: '', dateFrom: '', dateTo: '', search: '' };
@@ -4927,6 +5242,8 @@ onAuthStateChanged(auth, async (fbUser) => {
     distNidPreset = '';
     stopForwardInboxWatch();
     unsubscribeDealerStock(); // stop the previous session's realtime listener — never leak it into whoever logs in next on this tab
+    unsubscribeAdminStock(); unsubscribeDealerStockAdmin();
+    state.adminStock = {}; state.allDealerStock = {}; state.myStock = null; state.audit = emptyAuditState();
     state.user = null;
     state.dealers = []; state.unos = []; state.developers = []; state.distributions = []; state.duplicates = []; resetLogPager(); state.farmerSearchResults = null; state.dealerStock = {};
     state.saaos = []; state.saaoDealers = []; state.saaoSelectedDealer = null; state.farmerLookup = null; state.adminLedgerLookup = null; state.saaoPendingCount = null; state.admins = []; state.dealerSalesMeta = null;
@@ -5070,7 +5387,8 @@ const ADMIN_NAV = [
   { id: 'dashboard', label: 'ড্যাশবোর্ড', icon: 'dashboard' },
   { id: 'addDealer', label: 'ডিলার যুক্ত করুন', icon: 'addDealer' },
   { id: 'dealerList', label: 'ডিলার তালিকা', icon: 'dealers' },
-  { id: 'allocation', label: 'বরাদ্দ', icon: 'bag' },
+  { id: 'dealerStock', label: 'স্টক ব্যবস্থাপনা', icon: 'bag' },
+  { id: 'dealerAudit', label: 'ডিলার অডিট / প্রোফাইল', icon: 'reports' },
   { id: 'unoManagement', label: 'UNO ব্যবস্থাপনা', icon: 'uno' },
   { id: 'developerManagement', label: 'ডেভেলপার ব্যবস্থাপনা', icon: 'uno' },
   { id: 'saaoManagement', label: 'উপসহকারী ব্যবস্থাপনা', icon: 'uno' },
@@ -5107,7 +5425,8 @@ const DEVELOPER_NAV = [
 const UNO_NAV = [
   { id: 'dashboard', label: 'ড্যাশবোর্ড', icon: 'dashboard' },
   { id: 'dealerList', label: 'ডিলার তালিকা', icon: 'dealers' },
-  { id: 'allocation', label: 'বরাদ্দ', icon: 'bag' },
+  { id: 'dealerStock', label: 'স্টক ব্যবস্থাপনা', icon: 'bag' },
+  { id: 'dealerAudit', label: 'ডিলার অডিট / প্রোফাইল', icon: 'reports' },
   { id: 'distributions', label: 'বিতরণ রেকর্ড', icon: 'distribute' },
   { id: 'forwardings', label: 'ফরওয়ার্ডিং', icon: 'forward' },
   { id: 'duplicates', label: 'ডুপ্লিকেট লগ', icon: 'duplicate' },
@@ -5120,6 +5439,7 @@ const DEALER_NAV = [
   { id: 'dashboard', label: 'ড্যাশবোর্ড', icon: 'dashboard' },
   { id: 'distribute', label: 'সার বিতরণ করুন', icon: 'distribute' },
   { id: 'history', label: 'বিতরণ ইতিহাস', icon: 'history' },
+  { id: 'myStock', label: 'আমার স্টক', icon: 'bag' },
   { id: 'farmerSearch', label: 'কৃষক অনুসন্ধান', icon: 'search' },
   { id: 'profile', label: 'প্রোফাইল', icon: 'profile' },
 ];
@@ -5516,6 +5836,10 @@ function renderSidebar() {
     </div>`).join('');
 }
 function navigateTo(view) {
+  // The every-dealer stock listener is view-scoped (it grows with dealer count):
+  // only while স্টক ব্যবস্থাপনা / অফিস রিপোর্ট is open.
+  const stockViews = ['dealerStock', 'officeReport'];
+  if (stockViews.includes(currentView) && !stockViews.includes(view)) unsubscribeDealerStockAdmin();
   currentView = view;
   state.filters = { union: '', dealer: '', fertilizer: '', dateFrom: '', dateTo: '', search: '' };
   // Reset manual-edit flag on all qty inputs when navigating away from distribute
@@ -5540,9 +5864,11 @@ function navigateTo(view) {
     if (view === 'dashboard' && role === 'saao') loadSaaoTotals(false);
     if (view === 'forwardings' && (role === 'admin' || role === 'uno' || role === 'saao')) { winReset('fwd'); loadForwardList(true); }
     if (view === 'systemLogs' && (role === 'admin' || role === 'developer')) { resetLogPager(); ensureLogPage(1); } // v10.13d: one page (20) per read
-    if (view === 'allocation' && (role === 'admin' || role === 'uno')) loadAllocationData();
+    if ((view === 'dealerStock' || view === 'officeReport') && (role === 'admin' || role === 'uno') && !dealerStockAdminUnsub) subscribeDealerStockAdmin();
+    if (view === 'dealerAudit' && (role === 'admin' || role === 'uno') && state.audit.dealerId) loadDealerAudit(state.audit.dealerId);
+    if (view === 'myStock' && role === 'dealer') loadStockHistoryForDealer(state.user.id, { intoModal: false });
     if (view === 'officeReport' && (role === 'admin' || role === 'uno')) loadOfficeReport(false);
-    if ((view === 'reports' || view === 'dealerList' || view === 'allocation') && (role === 'admin' || role === 'uno' || role === 'developer') && !statsShowable() && !state.stats.recountPromise) getAccurateDashboardStats();
+    if ((view === 'reports' || view === 'dealerList') && (role === 'admin' || role === 'uno' || role === 'developer') && !statsShowable() && !state.stats.recountPromise) getAccurateDashboardStats();
     if (view === 'dashboard' && (role === 'admin' || role === 'uno' || role === 'developer')) {
       getAccurateDashboardStats().catch(e => console.warn('[FDMS] dashboard stats refresh failed', e));
     }
@@ -5582,7 +5908,8 @@ function renderCurrentView() {
       case 'dashboard': html = renderAdminDashboard(); break;
       case 'addDealer': html = renderAddDealerForm(); break;
       case 'dealerList': html = renderDealerList(); break;
-      case 'allocation': html = renderAllocation(); break;
+      case 'dealerStock': html = renderDealerStockDashboard(); break;
+      case 'dealerAudit': html = renderDealerAudit(); break;
       case 'unoManagement': html = renderUnoManagement(); break;
       case 'developerManagement': html = renderDeveloperManagement(); break;
       case 'saaoManagement': html = renderSaaoManagement(); break;
@@ -5617,7 +5944,8 @@ function renderCurrentView() {
     switch (currentView) {
       case 'dashboard': html = renderAdminDashboard(); break;
       case 'dealerList': html = renderDealerList(); break;
-      case 'allocation': html = renderAllocation(); break;
+      case 'dealerStock': html = renderDealerStockDashboard(); break;
+      case 'dealerAudit': html = renderDealerAudit(); break;
       case 'distributions': html = renderDistributionRecords(); break;
       case 'forwardings': html = renderForwardings(); break;
       case 'duplicates': html = renderDuplicateLog(); break;
@@ -5648,6 +5976,7 @@ function renderCurrentView() {
         html = state.user.backDataUploadEnabled ? renderDistributionForm(true) : renderDealerDashboard();
         break;
       case 'history': html = renderDealerHistory(); break;
+      case 'myStock': html = renderMyStockDashboard(); break;
       case 'farmerSearch': html = renderFarmerSearch(); break;
       case 'profile': html = renderDealerProfile(); break;
       default: html = renderDealerDashboard();
@@ -5919,8 +6248,8 @@ function renderDealerRow(d, idx, isAdmin) {
      • তারিখের বিতরণ — distributions, orderByChild('date') + equalTo(<তারিখ>) (".indexOn": "date")।
        "জন" = ঐ তারিখে ঐ ডিলারের কাছ থেকে সার নেওয়া আলাদা কৃষক (canonicalNid; NID না থাকলে মোবাইল)।
      • সর্বকালীন বিতরণ — ঐ ডিলারের নিজের distributions রেকর্ড, orderByChild('dealerId') ১০০০ করে
-       (syncDealerSales যে query ব্যবহার করে)। ৫ মিনিট cache, শুধু দেখানো ডিলারদের জন্য।
-     • বর্তমান মজুদ — dealers/{id}/stock/{সার} (অ্যাপের একমাত্র বর্তমান-মজুদ উৎস), পেজ খোলার সময় নতুন করে পড়া। */
+       (ডিলার অডিটের মতো একই query)। ৫ মিনিট cache, শুধু দেখানো ডিলারদের জন্য।
+     • বর্তমান মজুদ — dealerStock/{id}/{সার}.available (দুই-স্তরের স্টক; পেজ খোলা থাকা পর্যন্ত লাইভ)। */
 const OR_HEAD_FIXED = ['ইউনিয়ন', 'ডিলারের নাম', 'মোবাইল'];
 function orCanView() { const r = state.user && state.user.role; return r === 'admin' || r === 'uno'; }
 function orState() {
@@ -6023,7 +6352,8 @@ async function loadOfficeReport(force) {
 function orModel() {
   const O = orState(), dayReady = !!O.day && O.dayDate === O.date && !O.dayLoading;
   const rows = orDealersShown().map(d => {
-    const stock = d.stock || {};
+    const srow = state.allDealerStock[d.id] || {};
+    const stock = Object.fromEntries(FERTILIZERS.map(f => [f.v, normalizeStockRow(srow[f.v]).available]));
     const ferts = FERTILIZERS.map(f => round2(Number(stock[f.v]) || 0));
     const day = dayReady ? (O.day[d.id] || { kg: 0, farmers: new Set() }) : null;
     const life = O.life[d.id];
@@ -6141,350 +6471,956 @@ function officeReportPrint() {
   setTimeout(done, 1500);
 }
 
-/* ---------------- বরাদ্দ (Allocation) overview ----------------
-   Read-only reporting page: one row per dealer, combining data already
-   loaded client-side — state.dealers (each dealer carries its own flat
-   .stock sub-object, written by the admin from "ডিলার তথ্য পরিবর্তন") and
-   the precomputed dashboardStats.dealerStats aggregate (distribution
-   count/kg per dealer, kept correct incrementally — see mergeDashboardStats
-   above). No extra Firebase reads here: dealer count is small (O(dozens)),
-   so this stays entirely client-side with no pagination needed. */
-/* v10.11 — বরাদ্দ = what the Admin GAVE the dealer (not farmer distribution).
-   The existing stock architecture keeps ONE current value per fertilizer
-   (dealers/{id}/stock/{fert}): admin allocations ADD to it ("ডিলার তথ্য
-   পরিবর্তন" → স্টক যোগ, logged in dealerStockHistory) and every distribution
-   SUBTRACTS from it (dealerSales/{id}/byFert keeps the cumulative kg given out).
-   Manual physical-stock corrections (স্টক সমন্বয়) are kept apart in
-   dealers/{id}/stockAdjust/{fert} (net kg) so they never look like allocation:
-     মোট বিতরণ   = dealerSales/{id}/byFert/{fert}
-     বর্তমান স্টক = dealers/{id}/stock/{fert}
-     বরাদ্দ      = মোট বিতরণ + বর্তমান স্টক − স্টক সমন্বয়
-   (⇔ বর্তমান স্টক = বরাদ্দ − মোট বিতরণ + সমন্বয়). Old dealers without
-   stockAdjust read 0 — no migration. No distributions are scanned. */
+// Main Admin only (not while acting as a dealer) — farmer edits.
 function canManageStock() { const u = realUser(); return !!(u && u.role === 'admin' && u.isMainAdmin === true && !isDealerViewActive()); }
-function dealerSoldKg(dealerId, fert) { const m = state.dealerSalesMeta; return round2(Number(m && m[dealerId] && m[dealerId].byFert && m[dealerId].byFert[fert]) || 0); }
-function dealerFertFigures(d, fert) {
-  const stock = round2(Number((d && d.stock || {})[fert]) || 0);
-  const distributed = dealerSoldKg(d && d.id, fert);
-  const adjust = round2(Number((d && d.stockAdjust || {})[fert]) || 0);
-  return { allocation: round2(distributed + stock - adjust), distributed, stock, adjust };
+
+/* ---------------- two-level stock management — data + views (rebuilt) ----------------
+   dealerStock stays tiny regardless of how large `distributions` grows
+   (bounded by dealer-count × fertilizer-count), so admin/uno load it in
+   full exactly like `dealers` already is. A dealer only ever loads its own
+   dealerStock/{uid} subtree — never any other dealer's. stockHistory is
+   nested per-dealer (see schema comment above) so it is ALWAYS a plain
+   key-ordered per-dealer read (orderByKey+limitToLast) — no index, and
+   never loaded whole across every dealer.
+   The one-time dbGet() loaders that used to live here (loadDealerStockData,
+   loadMyStock) have been replaced by the live subscribeDealerStockAdmin /
+   subscribeMyStock / subscribeAdminStock listeners defined earlier in this
+   file (right after restoreDealerStock) — see the comment block there for
+   exactly when each one is subscribed/unsubscribed. */
+function renderStockHistoryTable() {
+  const rows = state.stockHistoryRows || [];
+  if (state.stockHistoryLoading) return `<div class="loading">তথ্য লোড হচ্ছে...</div>`;
+  if (!rows.length) return emptyState('এখনো কোনো স্টক লেনদেন নেই।');
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>তারিখ</th><th>সার</th><th>ধরন</th><th>পরিমাণ</th><th>আগের মজুদ</th><th>নতুন মজুদ</th><th>যিনি করেছেন</th><th>মন্তব্য</th></tr></thead><tbody>${rows.map(r => `<tr><td>${formatDate(r.date)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${esc(STOCK_TX_TYPES[r.transactionType] || r.transactionType)}</td><td>${ledgerQtyLabel(r)}</td><td>${r.previousStock ?? '-'}</td><td>${r.newStock ?? '-'}</td><td>${esc(r.addedByName || '-')}</td><td>${dashIfEmpty(r.note)}</td></tr>`).join('')}</tbody></table></div>`;
 }
-async function loadAllocationData() {
+// intoModal=true updates just the open modal's body (admin viewing a
+// dealer's history without leaving the Stock Dashboard); intoModal=false
+// re-renders the current page (dealer viewing their own history under
+// "আমার স্টক"). Firebase push keys sort chronologically, so
+// orderByKey()+limitToLast(100) on stockHistory/{dealerId} returns exactly
+// this dealer's most recent 100 transactions — no .indexOn needed at all.
+async function loadStockHistoryForDealer(dealerId, opts) {
+  const intoModal = !!(opts && opts.intoModal);
+  state.stockHistoryDealerId = dealerId;
+  state.stockHistoryLoading = true;
+  if (intoModal) { const body = document.getElementById('stockHistoryModalBody'); if (body) body.innerHTML = renderStockHistoryTable(); }
+  else renderCurrentView();
   try {
-    const [dl, sales] = await Promise.all([dbGet('dealers'), dbGet('dealerSales').catch(() => null)]);
-    if (dl) state.dealers = objToArray(dl);
-    state.dealerSalesMeta = sales || {};
-  } catch (e) { if (!state.dealerSalesMeta) state.dealerSalesMeta = null; }
-  if (currentView === 'allocation') renderCurrentView();
+    const snap = await get(query(ref(db, `stockHistory/${dealerId}`), orderByKey(), limitToLast(100)));
+    state.stockHistoryRows = objToArray(snap.exists() ? snap.val() : null).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  } catch (e) {
+    state.stockHistoryRows = [];
+  }
+  state.stockHistoryLoading = false;
+  if (intoModal) { const body = document.getElementById('stockHistoryModalBody'); if (body) body.innerHTML = renderStockHistoryTable(); }
+  else renderCurrentView();
 }
-function allocationRows() {
-  const q = (state.allocationSearch || '').trim().toLowerCase();
-  const u = state.allocationUnion || '';
-  return (state.dealers || [])
-    .filter(d => (!u || (d.union || '') === u) && (!q || (d.name || '').toLowerCase().includes(q) || (d.union || '').toLowerCase().includes(q) || (d.mobile || '').toLowerCase().includes(q)))
-    .map(d => ({ dealer: d, figs: Object.fromEntries(FERTILIZERS.map(f => [f.v, dealerFertFigures(d, f.v)])) }));
+function openStockHistoryModal(dealerId) {
+  const dealer = state.dealers.find(d => d.id === dealerId);
+  state.stockHistoryRows = [];
+  openModal(`<h3>স্টক লেনদেনের ইতিহাস — ${esc(dealer ? dealer.name : '')}</h3><div id="stockHistoryModalBody">${renderStockHistoryTable()}</div>`);
+  loadStockHistoryForDealer(dealerId, { intoModal: true });
 }
-function renderAllocation() {
-  const rows = allocationRows();
-  const salesReady = !!state.dealerSalesMeta;
-  const canStock = canManageStock();
-  const kg = v => `${kgFmt(v)} কেজি`;
-  const pend = '<span class="muted">লোড হচ্ছে...</span>';
-  const tot = {}; FERTILIZERS.forEach(f => { tot[f.v] = { allocation: 0, distributed: 0, stock: 0 }; });
-  rows.forEach(({ figs }) => FERTILIZERS.forEach(f => { const x = figs[f.v]; tot[f.v].allocation += x.allocation; tot[f.v].distributed += x.distributed; tot[f.v].stock += x.stock; }));
-  const sum = k => FERTILIZERS.reduce((a, f) => a + tot[f.v][k], 0);
-  const filtered = !!(state.allocationUnion || (state.allocationSearch || '').trim());
-  const summaryCard = `
-    <div class="glass-card" style="margin-bottom:14px;">
-      <div style="font-weight:700;margin-bottom:10px;">${filtered ? 'ফিল্টার করা ডিলারদের মোট' : 'সিস্টেম-ওয়াইড মোট (সকল ডিলার)'}</div>
-      <div class="table-wrap"><table class="mini-table"><thead><tr><th>সার</th><th>বরাদ্দ</th><th>মোট বিতরণ</th><th>বর্তমান স্টক</th></tr></thead><tbody>
-        ${FERTILIZERS.map(f => `<tr><td>${esc(f.l)}</td><td>${salesReady ? kg(tot[f.v].allocation) : pend}</td><td>${salesReady ? kg(tot[f.v].distributed) : pend}</td><td>${kg(tot[f.v].stock)}</td></tr>`).join('')}
-        <tr><td><b>মোট</b></td><td><b>${salesReady ? kg(sum('allocation')) : pend}</b></td><td><b>${salesReady ? kg(sum('distributed')) : pend}</b></td><td><b>${kg(sum('stock'))}</b></td></tr>
-      </tbody></table></div>
-      <p class="muted" style="font-size:11.5px;margin-top:6px;">বরাদ্দ = অ্যাডমিন কর্তৃক ডিলারকে দেওয়া সার · মোট বিতরণ = ডিলার কৃষকদের যা দিয়েছেন · বর্তমান স্টক = বরাদ্দ − মোট বিতরণ (± স্টক সমন্বয়)</p>
-    </div>`;
-  const AW = winSlice('alloc', rows);
-  const cards = AW.rows.map(({ dealer: d, figs }) => `
+// Shared by both the admin dashboard and the Stock Management page. Reads
+// ONLY the already-loaded adminStock/dealerStock (never distributions) —
+// see computeStockIntegrityIssues. Never auto-corrects anything; this is
+// purely a visible warning so Main Admin can investigate/adjust manually.
+function renderStockIntegrityWarning() {
+  const issues = computeStockIntegrityIssues();
+  if (!issues.length) return '';
+  const rows = issues.slice(0, 20).map(iss => iss.scope === 'admin'
+    ? `<li>কেন্দ্রীয় স্টক — ${esc(fertilizerLabel(iss.fertilizer))}: গৃহীত ${iss.row.received} − বরাদ্দ ${iss.row.allocated} ≠ মজুদ ${iss.row.available}</li>`
+    : `<li>${esc(iss.dealerName || iss.dealerId)} — ${esc(fertilizerLabel(iss.fertilizer))}: গৃহীত ${iss.row.received} − বিতরণকৃত ${iss.row.distributed} ≠ মজুদ ${iss.row.available}</li>`
+  ).join('');
+  return `<div class="db-error" style="margin-bottom:16px;"><strong>⚠ Stock Integrity Warning — ${issues.length}টি অসামঞ্জস্যতা পাওয়া গেছে</strong>
+    <p class="muted" style="margin:6px 0;">নিচের এন্ট্রিগুলো স্বয়ংক্রিয়ভাবে ঠিক করা হয়নি — Main Admin ম্যানুয়ালি যাচাই করে সমন্বয় করুন।</p>
+    <ul style="margin:0 0 0 18px;padding:0;">${rows}</ul></div>`;
+}
+function renderDealerStockCard(d) {
+  const stock = state.allDealerStock[d.id] || {};
+  return `
     <div class="glass-card" style="margin-bottom:14px;">
       <div class="row-between" style="margin-bottom:10px;">
-        <div><div style="font-weight:700;">${esc(d.name)} ${d.status === 'inactive' ? '<span class="badge badge-red">নিষ্ক্রিয়</span>' : ''}</div><div class="muted">${esc(d.union)} | ${esc(d.mobile)}</div></div>
-        ${canStock ? `<button class="btn btn-outline btn-sm" data-action="edit-dealer" data-id="${d.id}">বরাদ্দ দিন (স্টক যোগ)</button>` : ''}
+        <div><div style="font-weight:700;">${esc(d.name)}</div><div class="muted">${esc(d.union)} | ${esc(d.mobile)}</div></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-outline btn-sm" data-action="open-transfer-stock" data-dealer-id="${d.id}">ট্রান্সফার করুন</button>
+          ${state.user.role === 'admin' ? `<button class="btn btn-outline btn-sm" data-action="open-stock-adjust" data-target="${d.id}">± সমন্বয়</button>` : ''}
+          <button class="btn btn-outline btn-sm" data-action="view-stock-history" data-dealer-id="${d.id}">ইতিহাস</button>
+        </div>
       </div>
-      <div class="table-wrap"><table class="mini-table"><thead><tr><th>সার</th><th>বরাদ্দ</th><th>মোট বিতরণ</th><th>বর্তমান স্টক</th>${canStock ? '<th>স্টক সমন্বয়</th>' : ''}</tr></thead><tbody>
+      <div class="table-wrap"><table class="mini-table"><thead><tr><th>সার</th><th>গৃহীত</th><th>বিতরণকৃত</th><th>মজুদ আছে</th></tr></thead><tbody>
         ${FERTILIZERS.map(f => {
-          const x = figs[f.v];
-          return `<tr><td>${esc(f.l)}</td><td>${salesReady ? kg(x.allocation) : pend}</td><td>${salesReady ? kg(x.distributed) : pend}</td><td><span class="badge ${x.stock <= 0 ? 'badge-red' : 'badge-green'}">${kg(x.stock)}</span>${x.adjust ? `<br><small class="muted">সমন্বয় ${x.adjust > 0 ? '+' : ''}${kgFmt(x.adjust)}</small>` : ''}</td>${canStock ? `<td><button class="btn btn-outline btn-sm" data-action="stock-adjust-open" data-id="${esc(d.id)}" data-fert="${esc(f.v)}">${ic('edit', 'icon-sm')} Edit Stock</button></td>` : ''}</tr>`;
+          const row = normalizeStockRow(stock[f.v]);
+          const badgeCls = row.available <= 0 ? 'badge-red' : 'badge-green';
+          return `<tr><td>${esc(f.l)}</td><td>${row.received.toLocaleString('bn-BD')}</td><td>${row.distributed.toLocaleString('bn-BD')}</td><td><span class="badge ${badgeCls}">${row.available.toLocaleString('bn-BD')} কেজি</span></td></tr>`;
         }).join('')}
       </tbody></table></div>
-    </div>`).join('');
-  const unionOpts = dealerUnionOptions();
-  return `
-    <div class="page-header"><h2>বরাদ্দ</h2><div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <button class="btn btn-outline btn-sm" data-action="export-today-sales">${ic('export', 'icon-sm')} আজকের বিক্রয় ও স্টক CSV</button>
-      <button class="btn btn-primary btn-sm" data-action="export-allocation">CSV ডাউনলোড</button>
-    </div></div>
-    ${renderStockReportCard()}
-    ${state.user.role === 'admin' ? renderSalesSyncCard() : ''}
-    <div class="glass-card filter-bar dealer-filter-bar" style="margin-bottom:14px;">
-      <div class="field"><label for="allocUnionFilter">ইউনিয়ন</label><select id="allocUnionFilter"><option value="">সকল ইউনিয়ন</option>${unionOpts.map(o => `<option value="${esc(o.v)}" ${state.allocationUnion === o.v ? 'selected' : ''}>${esc(o.v)} (${bnInt(o.n)})</option>`).join('')}</select></div>
-      <div class="field"><label>খুঁজুন (ডিলারের নাম/ইউনিয়ন/মোবাইল)</label><input type="text" id="allocationSearchInput" value="${esc(state.allocationSearch || '')}" placeholder="নাম, ইউনিয়ন বা মোবাইল লিখুন"></div>
-      <div class="field dealer-filter-count"><label>&nbsp;</label><div class="muted">${bnInt(rows.length)} জন ডিলার</div></div>
-    </div>
-    ${summaryCard}
-    ${rows.length ? cards + `<div class="glass-card">${renderWinPager(AW, 'জন ডিলার')}</div>` : `<div class="glass-card">${emptyState('কোনো ডিলার পাওয়া যায়নি।')}</div>`}
-  `;
-}
-function exportAllocationCSV() {
-  const out = [];
-  allocationRows().forEach(({ dealer: d, figs }) => FERTILIZERS.forEach(f => {
-    const x = figs[f.v];
-    out.push([d.name, d.union, f.l, x.allocation, x.distributed, x.stock, x.adjust]);
-  }));
-  downloadCSV(`allocation_${todayStr()}.csv`, toCSV(['ডিলার', 'ইউনিয়ন', 'সার', 'বরাদ্দ(কেজি)', 'মোট বিতরণ(কেজি)', 'বর্তমান স্টক(কেজি)', 'স্টক সমন্বয়(কেজি)'], out));
-}
-
-/* ---- Main Admin: স্টক সমন্বয় (current stock correction, reason required, audited) ---- */
-async function openStockAdjustModal(dealerId, fert) {
-  if (!canManageStock()) { showToast('স্টক সমন্বয় শুধুমাত্র Main Admin করতে পারবেন', 'error'); return; }
-  const d = (state.dealers || []).find(x => x.id === dealerId);
-  if (!d || !FERTILIZERS.some(f => f.v === fert)) { showToast('ডিলার বা সার পাওয়া যায়নি', 'error'); return; }
-  let cur = null;
-  try { cur = round2(Number(await dbGet(`dealers/${dealerId}/stock/${fert}`)) || 0); } catch (e) { showToast('বর্তমান স্টক পড়া যায়নি: ' + ((e && e.message) || ''), 'error'); return; }
-  openModal(`
-    <h3>স্টক সমন্বয় (Edit Stock)</h3>
-    <div class="info-list" style="margin-bottom:12px;">
-      <div><b>ডিলার:</b> ${esc(d.name)} · ${esc(d.union || '')}</div>
-      <div><b>সার:</b> ${esc(fertilizerLabel(fert))}</div>
-      <div><b>বর্তমান স্টক:</b> ${kgFmt(cur)} কেজি</div>
-    </div>
-    <form id="stockAdjustForm" data-id="${esc(dealerId)}" data-fert="${esc(fert)}" data-prev="${cur}">
-      <div class="field"><label>নতুন স্টক (কেজি)</label><input type="number" name="newStock" min="0" step="0.01" inputmode="decimal" required value="${cur}"></div>
-      <p class="muted" id="stockAdjustDiff" style="margin:-6px 0 10px;font-size:12px;">পরিবর্তন: ০ কেজি</p>
-      <div class="field"><label>কারণ (বাধ্যতামূলক)</label><textarea name="reason" rows="2" minlength="5" required placeholder="যেমন: গুদামে সরেজমিন গণনা অনুযায়ী সংশোধন"></textarea></div>
-      <p class="muted" style="font-size:11.5px;margin-bottom:10px;">এটি বরাদ্দ নয় — শুধু বর্তমান স্টক সংশোধন। বরাদ্দ বাড়াতে "বরাদ্দ দিন (স্টক যোগ)" ব্যবহার করুন। প্রতিটি সমন্বয় অডিট লগে থাকবে।</p>
-      <button type="submit" class="btn btn-primary" style="width:100%;" id="stockAdjustBtn">সমন্বয় সংরক্ষণ করুন</button>
-    </form>
-  `);
-}
-async function handleStockAdjustSubmit(form) {
-  if (!canManageStock()) { showToast('স্টক সমন্বয় শুধুমাত্র Main Admin করতে পারবেন', 'error'); return; }
-  if (form.dataset.busy) return;
-  const dealerId = form.dataset.id, fert = form.dataset.fert;
-  const d = (state.dealers || []).find(x => x.id === dealerId);
-  const newStock = round2(parseFloat(normalizeBanglaDigits(form.newStock.value)));
-  const reason = form.reason.value.trim();
-  if (!d || !FERTILIZERS.some(f => f.v === fert)) { showToast('ডিলার বা সার পাওয়া যায়নি', 'error'); return; }
-  if (isNaN(newStock) || newStock < 0) { showToast('সঠিক নতুন স্টক দিন (০ বা বেশি)', 'error'); return; }
-  if (reason.length < 5) { showToast('সমন্বয়ের কারণ লিখুন (কমপক্ষে ৫ অক্ষর)', 'error'); return; }
-  form.dataset.busy = '1';
-  const btn = document.getElementById('stockAdjustBtn');
-  if (btn) { btn.disabled = true; btn.textContent = 'সংরক্ষণ হচ্ছে...'; }
-  const admin = realUser();
-  try {
-    // The value at commit time is the "previous" (a dealer may be distributing right now).
-    let prev = 0;
-    const tx = await runTransaction(ref(db, `dealers/${dealerId}/stock/${fert}`), (cur) => { prev = round2(Number(cur) || 0); return newStock; });
-    if (!tx.committed) throw new Error('স্টক হালনাগাদ হয়নি — আবার চেষ্টা করুন');
-    const adj = round2(newStock - prev);
-    const now = Date.now();
-    if (adj) {
-      const hk = push(ref(db, 'dealerStockHistory')).key;
-      try {
-        await update(ref(db), {
-          [`dealers/${dealerId}/stockAdjust/${fert}`]: increment(adj),
-          [`dealerStockHistory/${hk}`]: { dealerId, dealerName: d.name || '', fertilizer: fert, previousStock: prev, newStock, amountChanged: adj, changeType: 'stock_adjustment', reason, changedBy: admin.name || admin.email || admin.uid, adminUid: admin.uid, createdAt: now },
-        });
-      } catch (e2) {
-        writeSystemLog('error', 'stock_adjustment_meta_failed', `${d.name}/${fert}: ${(e2 && e2.message) || ''} — স্টক ${prev}→${newStock} হয়েছে, সমন্বয়ের হিসাব সংরক্ষণ হয়নি`);
-        showToast('স্টক বদলেছে, কিন্তু সমন্বয়ের হিসাব সংরক্ষণ হয়নি — বরাদ্দ ভুল দেখাতে পারে', 'warn');
-      }
-    }
-    writeSystemLog('settings', 'stock_adjustment', `ডিলার: ${d.name} | ${fert}: ${prev} → ${newStock} কেজি (${adj > 0 ? '+' : ''}${adj}) | কারণ: ${reason}`, {
-      adminUid: admin.uid, adminName: admin.name || '', dealerId, dealerName: d.name || '', fertilizer: fert, previousStock: prev, newStock, adjustmentAmount: adj, reason,
-    });
-    d.stock = { ...(d.stock || {}), [fert]: newStock };
-    if (adj) d.stockAdjust = { ...(d.stockAdjust || {}), [fert]: round2((Number((d.stockAdjust || {})[fert]) || 0) + adj) };
-    closeModal();
-    showToast(adj ? `স্টক সমন্বয় হয়েছে: ${kgFmt(prev)} → ${kgFmt(newStock)} কেজি` : 'স্টক অপরিবর্তিত (একই মান)', adj ? 'success' : 'info');
-    renderCurrentView();
-  } catch (e) {
-    delete form.dataset.busy;
-    if (btn) { btn.disabled = false; btn.textContent = 'সমন্বয় সংরক্ষণ করুন'; }
-    showToast('সমন্বয় করা যায়নি: ' + ((e && e.message) || ''), 'error');
-  }
-}
-
-/* ---- Dealer Stock & Allocation Report (date-wise, CSV) ----
-   For the selected date: বরাদ্দ (as above), আজ বিতরণ = ONLY that date's
-   distribution records (one indexed date query, batched), বর্তমান স্টক =
-   current stock. Dealers and dealerSales are re-read fresh. The CSV holds the
-   COMPLETE filtered set (every dealer × fertilizer of the scope), not a page. */
-function emptyStockReport() { return { date: todayStr(), union: '', dealer: '', rows: null, loading: false, error: '', records: 0, builtFor: '' }; }
-function stockReportKey(R) { return `${R.date}|${R.union}|${R.dealer}`; }
-function renderStockReportCard() {
-  const R = state.stockReport || (state.stockReport = emptyStockReport());
-  const dealersInUnion = (state.dealers || []).filter(d => !R.union || (d.union || '') === R.union).sort((a, b) => String(a.name).localeCompare(String(b.name)));
-  const fresh = R.rows && R.builtFor === stockReportKey(R);
-  let body = '';
-  if (R.loading) body = `<div class="loading">রিপোর্ট তৈরি হচ্ছে...${R.records ? ` (${bnInt(R.records)} টি রেকর্ড)` : ''}</div>`;
-  else if (R.error) body = `<div class="db-error">${esc(R.error)}</div>`;
-  else if (fresh) {
-    const W = winSlice('stockrep', R.rows);
-    body = R.rows.length ? `<div class="table-wrap"><table class="mini-table"><thead><tr><th>তারিখ</th><th>ডিলার</th><th>ইউনিয়ন</th><th>সার</th><th>বরাদ্দ</th><th>আজ বিতরণ</th><th>বর্তমান স্টক</th></tr></thead><tbody>${W.rows.map(r => `<tr><td>${esc(r.dateTxt)}</td><td>${esc(r.dealer)}</td><td>${esc(r.union)}</td><td>${esc(r.fert)}</td><td>${kgFmt(r.allocation)}</td><td><b>${kgFmt(r.day)}</b></td><td>${kgFmt(r.stock)}</td></tr>`).join('')}</tbody></table></div>${renderWinPager(W, 'টি সারি')}<p class="muted" style="font-size:11.5px;margin-top:4px;">${esc(R.dateTxtFull || '')} তারিখের ${bnInt(R.records)} টি বিতরণ রেকর্ড থেকে · মোট আজ বিতরণ ${kgFmt(R.rows.reduce((a, r) => a + r.day, 0))} কেজি</p>` : emptyState('এই ফিল্টারে কোনো ডিলার নেই।');
-  }
-  return `
-    <div class="glass-card" style="margin-bottom:14px;">
-      <div style="font-weight:700;margin-bottom:8px;">ডিলার স্টক ও বরাদ্দ রিপোর্ট (Dealer Stock &amp; Allocation Report)</div>
-      <div class="filter-bar stock-report-bar">
-        <div class="field"><label>তারিখ</label><input type="date" id="stockRepDate" value="${esc(R.date)}" max="${todayStr()}"></div>
-        <div class="field"><label>ইউনিয়ন</label><select id="stockRepUnion"><option value="">সকল ইউনিয়ন</option>${dealerUnionOptions().map(o => `<option value="${esc(o.v)}" ${R.union === o.v ? 'selected' : ''}>${esc(o.v)}</option>`).join('')}</select></div>
-        <div class="field"><label>ডিলার</label><select id="stockRepDealer"><option value="">সকল ডিলার</option>${dealersInUnion.map(d => `<option value="${esc(d.id)}" ${R.dealer === d.id ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></div>
-        <div class="field"><label>&nbsp;</label><div style="display:flex;gap:6px;flex-wrap:wrap;"><button type="button" class="btn btn-outline btn-sm" data-action="stock-report-build" ${R.loading ? 'disabled' : ''}>রিপোর্ট দেখুন</button><button type="button" class="btn btn-primary btn-sm" data-action="stock-report-csv" ${R.loading ? 'disabled' : ''}>${ic('export', 'icon-sm')} CSV Export</button></div></div>
-      </div>
-      ${body}
     </div>`;
 }
-function csvDateDash(iso) { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); return m ? `${m[3]}-${m[2]}-${m[1]}` : iso; }
-async function buildStockReport() {
-  const R = state.stockReport || (state.stockReport = emptyStockReport());
-  if (R.loading) return null;
-  if (!isoDateStr(R.date) || R.date > todayStr()) { showToast('সঠিক তারিখ দিন (আজ বা আগের)', 'error'); return null; }
-  const key = stockReportKey(R);
-  Object.assign(R, { loading: true, error: '', rows: null, records: 0 });
-  renderCurrentView();
-  try {
-    const [dl, sales] = await Promise.all([dbGet('dealers'), dbGet('dealerSales').catch(() => null)]);
-    state.dealers = objToArray(dl);
-    state.dealerSalesMeta = sales || {};
-    const scope = state.dealers.filter(d => (!R.union || (d.union || '') === R.union) && (!R.dealer || d.id === R.dealer))
-      .sort((a, b) => String(a.union || '').localeCompare(String(b.union || '')) || String(a.name || '').localeCompare(String(b.name || '')));
-    const inScope = new Set(scope.map(d => d.id));
-    const recs = await fetchAllDistributionsForExport({ union: '', dealer: '', fertilizer: '', dateFrom: R.date, dateTo: R.date, search: '' }, (n) => { R.records = n; if (currentView === 'allocation') renderCurrentView(); });
-    const day = {};
-    let used = 0;
-    recs.forEach(r => {
-      if (!inScope.has(r.dealerId) || String(r.date || '') !== R.date || !r.fertilizer) return;
-      used++;
-      const m = day[r.dealerId] || (day[r.dealerId] = {});
-      m[r.fertilizer] = round2((m[r.fertilizer] || 0) + recordKg(r));
-    });
-    const dateTxt = csvDateDash(R.date);
-    const rows = [];
-    scope.forEach(d => FERTILIZERS.forEach(f => {
-      const x = dealerFertFigures(d, f.v);
-      rows.push({ dateTxt, dealer: d.name || d.id, union: d.union || '', fert: f.l, allocation: x.allocation, day: round2((day[d.id] && day[d.id][f.v]) || 0), stock: x.stock });
-    }));
-    Object.assign(R, { rows, records: used, builtFor: key, dateTxtFull: formatDate(R.date), loading: false });
-    winReset('stockrep');
-  } catch (e) {
-    Object.assign(R, { loading: false, error: 'রিপোর্ট তৈরি করা যায়নি: ' + ((e && e.message) || '') });
-  }
-  if (currentView === 'allocation') renderCurrentView();
-  return R.rows;
+function renderAdminStockSummary() {
+  return `
+    <div class="glass-card" style="margin-bottom:16px;">
+      <div class="row-between" style="margin-bottom:10px;"><h3>কেন্দ্রীয়/উপজেলা স্টক (Level 1)</h3><div style="display:flex;gap:6px;flex-wrap:wrap;">${state.user.role === 'admin' ? '<button class="btn btn-primary btn-sm" data-action="open-receive-central-stock">কেন্দ্রীয় স্টক যোগ করুন</button>' : ''}${state.user.role === 'admin' ? `<button class="btn btn-outline btn-sm" data-action="open-stock-adjust" data-target="central">± কেন্দ্রীয় সমন্বয়</button>` : ''}<button class="btn btn-outline btn-sm" data-action="view-central-stock-history">কেন্দ্রীয় ইতিহাস</button></div></div>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>সার</th><th>Received</th><th>Allocated</th><th>Available</th></tr></thead><tbody>
+        ${FERTILIZERS.map(f => {
+          const row = normalizeAdminStockRow(state.adminStock[f.v]);
+          const badgeCls = row.available <= 0 ? 'badge-red' : 'badge-green';
+          return `<tr><td>${esc(f.l)}</td><td>${row.received.toLocaleString('bn-BD')} KG</td><td>${row.allocated.toLocaleString('bn-BD')} KG</td><td><span class="badge ${badgeCls}">${row.available.toLocaleString('bn-BD')} KG</span></td></tr>`;
+        }).join('')}
+      </tbody></table></div>
+    </div>`;
 }
-async function exportStockReportCSV() {
-  const R = state.stockReport || (state.stockReport = emptyStockReport());
-  const rows = R.rows && R.builtFor === stockReportKey(R) ? R.rows : await buildStockReport();
-  if (!rows) return;
-  downloadCSV(`dealer_stock_allocation_${R.date}${R.union ? '_union' : ''}${R.dealer ? '_dealer' : ''}.csv`, toCSV(['তারিখ', 'ডিলার', 'ইউনিয়ন', 'সার', 'বরাদ্দ', 'আজ বিতরণ', 'বর্তমান স্টক'], rows.map(r => [r.dateTxt, r.dealer, r.union, r.fert, r.allocation, r.day, r.stock])));
-  writeSystemLog('data_entry', 'stock_report_exported', `তারিখ: ${R.date} | ইউনিয়ন: ${R.union || 'সকল'} | ডিলার: ${R.dealer || 'সকল'} | সারি: ${rows.length}`);
-  showToast(`রিপোর্ট ডাউনলোড হয়েছে (${bnInt(rows.length)} টি সারি)`, 'success');
+function renderDealerStockDashboard() {
+  const search = (state.stockSearch || '').trim().toLowerCase();
+  const filteredDealers = state.dealers.filter(d => !search || (d.name || '').toLowerCase().includes(search) || (d.mobile || '').includes(search));
+  const totals = {};
+  FERTILIZERS.forEach(f => totals[f.v] = emptyStockRow());
+  state.dealers.forEach(d => {
+    const stock = state.allDealerStock[d.id] || {};
+    FERTILIZERS.forEach(f => {
+      const row = normalizeStockRow(stock[f.v]);
+      totals[f.v].received += row.received;
+      totals[f.v].distributed += row.distributed;
+      totals[f.v].available += row.available;
+    });
+  });
+  return `
+    <div class="page-header"><h2>স্টক ব্যবস্থাপনা</h2><span class="muted">কেন্দ্রীয় স্টক ও প্রতিটি ডিলারের স্টক</span></div>
+    ${renderStockIntegrityWarning()}
+    ${renderAdminStockSummary()}
+    <div class="glass-card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:10px;">সার্বিক ডিলার স্টক সারাংশ (সকল ডিলার একত্রে)</h3>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>সার</th><th>মোট গৃহীত</th><th>মোট বিতরণকৃত</th><th>মোট মজুদ আছে</th></tr></thead><tbody>
+        ${FERTILIZERS.map(f => `<tr><td>${esc(f.l)}</td><td>${totals[f.v].received.toLocaleString('bn-BD')} কেজি</td><td>${totals[f.v].distributed.toLocaleString('bn-BD')} কেজি</td><td>${totals[f.v].available.toLocaleString('bn-BD')} কেজি</td></tr>`).join('')}
+      </tbody></table></div>
+    </div>
+    <div class="glass-card" style="margin-bottom:14px;">
+      <div class="field" style="margin-bottom:0;"><label>ডিলার খুঁজুন (নাম/মোবাইল)</label><input type="text" data-stock-search value="${esc(state.stockSearch || '')}" placeholder="ডিলারের নাম বা মোবাইল লিখুন"></div>
+    </div>
+    ${state.allDealerStockLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : state.allDealerStockError ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(state.allDealerStockError)}</div>` : filteredDealers.length ? filteredDealers.map(d => renderDealerStockCard(d)).join('') : emptyState('কোনো ডিলার পাওয়া যায়নি।')}
+  `;
 }
-// (feature) "আজকের বিক্রয় ও স্টক" report: per dealer, per fertilizer — how
-// much was sold TODAY and how much is currently available. Reuses the same
-// indexed, batched fetchAllDistributionsForExport() path every other CSV
-// export here uses (dateFrom === dateTo === today, on the already-indexed
-// "date" field) — on a normal day this pulls only that single day's rows
-// across all dealers, never the full distributions table, then aggregates
-// client-side (small, bounded set). Current stock comes from the already-
-// loaded state.dealers[].stock — no extra Firebase read for that part.
-async function exportTodaySalesCSV() {
-  const btn = document.querySelector('[data-action="export-today-sales"]');
-  const origText = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.textContent = 'এক্সপোর্ট হচ্ছে...'; }
+function renderMyStockDashboard() {
+  const stock = state.myStock || {};
+  return `
+    <div class="page-header"><h2>আমার স্টক</h2></div>
+    <div class="glass-card" style="margin-bottom:16px;">
+      ${state.myStockLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : `<div class="table-wrap"><table class="data-table"><thead><tr><th>সার</th><th>গৃহীত</th><th>বিতরণকৃত</th><th>মজুদ আছে</th></tr></thead><tbody>${FERTILIZERS.map(f => {
+        const row = normalizeStockRow(stock[f.v]);
+        const badgeCls = row.available <= 0 ? 'badge-red' : 'badge-green';
+        return `<tr><td>${esc(f.l)}</td><td>${row.received.toLocaleString('bn-BD')} কেজি</td><td>${row.distributed.toLocaleString('bn-BD')} কেজি</td><td><span class="badge ${badgeCls}">${row.available.toLocaleString('bn-BD')} কেজি</span></td></tr>`;
+      }).join('')}</tbody></table></div>`}
+    </div>
+    <div class="glass-card">
+      <h3 style="margin-bottom:10px;">স্টক লেনদেনের ইতিহাস (সাম্প্রতিক ১০০টি)</h3>
+      ${renderStockHistoryTable()}
+    </div>
+  `;
+}
+
+/* ---------------- LEVEL 1: admin receives central stock (unconditional credit) ---------------- */
+function openReceiveCentralStockModal() {
+  openModal(`
+    <h3>কেন্দ্রীয় স্টক যোগ করুন</h3>
+    <p class="muted" style="margin-top:-6px;margin-bottom:12px;">সরকার/সরবরাহকারী থেকে উপজেলা কেন্দ্রে নতুন সার গ্রহণ — এটি সরাসরি কোনো ডিলারের স্টক নয়, কেন্দ্রীয় মজুদে যোগ হবে।</p>
+    <form id="receiveCentralStockForm">
+      <div class="field"><label>সারের নাম</label><select name="fertilizer" required><option value="">-- নির্বাচন করুন --</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}">${esc(f.l)}</option>`).join('')}</select></div>
+      <div id="receiveCentralStockCurrentInfo" class="muted" style="margin:-6px 0 14px;"></div>
+      <div class="form-grid cols-2">
+        <div class="field"><label>পরিমাণ (কেজি)</label><input type="number" name="quantity" min="0.5" step="0.5" required></div>
+        <div class="field"><label>তারিখ</label><input type="date" name="date" value="${todayStr()}" max="${todayStr()}" required></div>
+      </div>
+      <div class="field"><label>রেফারেন্স/নোট (ঐচ্ছিক)</label><input type="text" name="note" placeholder="যেমন: সরকারি বরাদ্দ, চালান নং..."></div>
+      <button type="submit" class="btn btn-primary" id="receiveCentralStockSubmitBtn" style="width:100%;">সংরক্ষণ করুন</button>
+    </form>
+  `);
+  updateReceiveCentralStockCurrentInfo();
+}
+function updateReceiveCentralStockCurrentInfo() {
+  const form = document.getElementById('receiveCentralStockForm');
+  const infoEl = document.getElementById('receiveCentralStockCurrentInfo');
+  if (!form || !infoEl) return;
+  const fertilizer = form.fertilizer.value;
+  if (!fertilizer) { infoEl.textContent = ''; return; }
+  const row = normalizeAdminStockRow(state.adminStock[fertilizer]);
+  infoEl.innerHTML = `বর্তমান কেন্দ্রীয় মজুদ (এই এন্ট্রির আগে): <b>${row.available.toLocaleString('bn-BD')} কেজি</b> · এ পর্যন্ত মোট গৃহীত: ${row.received.toLocaleString('bn-BD')} কেজি`;
+}
+// Unconditional credit — there is no upstream pool to validate against (this
+// IS the top of the funnel), so a single runTransaction on adminStock/{fertilizer}
+// is enough: atomic and race-safe against a concurrent transfer-out reserving
+// from the same fertilizer at the same instant, with no block/abort condition needed.
+async function receiveCentralStock(fertilizer, quantity, date, note) {
+  const stockRef = ref(db, `adminStock/${fertilizer}`);
+  let previousStock = 0, newStock = 0;
+  const txResult = await runStockTransactionWithCacheWarmup(stockRef, (current) => {
+    const cur = normalizeAdminStockRow(current);
+    previousStock = cur.available;
+    newStock = cur.available + quantity;
+    return { received: cur.received + quantity, allocated: cur.allocated, available: newStock };
+  });
+  if (!txResult.committed) throw new Error('কেন্দ্রীয় স্টক আপডেট করা যায়নি');
+  return { previousStock, newStock };
+}
+async function handleReceiveCentralStockSubmit(form) {
+  if (isSubmitting) return;
+  if (!state.user || state.user.role !== 'admin') { showToast('কেন্দ্রীয় স্টক শুধু অ্যাডমিন যোগ করতে পারবেন', 'error'); return; }
+  const fertilizer = form.fertilizer.value;
+  const quantity = parseFloat(form.quantity.value);
+  const date = form.date.value;
+  const note = form.note.value.trim();
+  if (!fertilizer) { showToast('সারের নাম নির্বাচন করুন', 'error'); return; }
+  if (!validateStockQuantity(quantity)) { showToast('সঠিক পরিমাণ দিন (০ এর বেশি)', 'error'); return; }
+  if (date && new Date(date) > new Date()) { showToast('ভবিষ্যতের তারিখ দেওয়া যাবে না', 'error'); return; }
+  isSubmitting = true;
+  const btn = document.getElementById('receiveCentralStockSubmitBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'সংরক্ষণ হচ্ছে...'; }
   try {
-    const today = todayStr();
-    const todayFilters = { union: '', dealer: '', fertilizer: '', dateFrom: today, dateTo: today, search: '' };
-    const todayRows = await fetchAllDistributionsForExport(todayFilters, (count) => {
-      if (btn) btn.textContent = `এক্সপোর্ট হচ্ছে... (${count})`;
-    });
-    const soldByDealer = {};
-    todayRows.forEach(r => {
-      if (!soldByDealer[r.dealerId]) soldByDealer[r.dealerId] = {};
-      soldByDealer[r.dealerId][r.fertilizer] = (Number(soldByDealer[r.dealerId][r.fertilizer]) || 0) + (parseFloat(r.quantity) || 0);
-    });
-    const rows = state.dealers.map((d, i) => {
-      const sold = soldByDealer[d.id] || {};
-      const stock = d.stock || {};
-      const soldTotal = FERTILIZERS.reduce((s, f) => s + (Number(sold[f.v]) || 0), 0);
-      const stockTotal = FERTILIZERS.reduce((s, f) => s + (Number(stock[f.v]) || 0), 0);
-      return [
-        i + 1, d.name, d.union,
-        ...FERTILIZERS.map(f => Number(sold[f.v]) || 0), soldTotal,
-        ...FERTILIZERS.map(f => Number(stock[f.v]) || 0), stockTotal,
-      ];
-    });
-    downloadCSV(`today_sales_stock_${today}.csv`, toCSV(
-      ['#', 'ডিলার', 'ইউনিয়ন',
-        ...FERTILIZERS.map(f => `আজকে বিক্রি: ${f.l}(কেজি)`), 'আজকে মোট বিক্রি(কেজি)',
-        ...FERTILIZERS.map(f => `বর্তমান স্টক: ${f.l}(কেজি)`), 'বর্তমান মোট স্টক(কেজি)'],
-      rows
-    ));
-    showToast(`আজকের বিক্রয় ও স্টক রিপোর্ট ডাউনলোড হয়েছে (${todayRows.length} টি রেকর্ড থেকে)`, 'success');
+    const { previousStock, newStock } = await receiveCentralStock(fertilizer, quantity, date, note);
+    try {
+      await recordAdminStockHistory({
+        fertilizer, transactionType: 'CENTRAL_STOCK_RECEIVED', quantity, previousStock, newStock,
+        note, date: date || todayStr(),
+      });
+    } catch (e) { writeSystemLog('error', 'admin_stock_history_failed', (e && e.message) || 'unknown'); }
+    // No local optimistic patch and no manual re-fetch here — this modal
+    // only ever opens from the Stock Management page, where
+    // subscribeAdminStock() is already live (see loadAllData), so the
+    // committed change above lands on screen the instant Firebase pushes it.
+    showToast(`কেন্দ্রীয় স্টক যুক্ত হয়েছে — পূর্ববর্তী: ${previousStock.toLocaleString('bn-BD')} কেজি → নতুন: ${newStock.toLocaleString('bn-BD')} কেজি`, 'success');
+    writeSystemLog('data_entry', 'central_stock_received', `${fertilizerLabel(fertilizer)} +${quantity} কেজি`);
+    closeModal();
   } catch (e) {
-    showToast('এক্সপোর্ট ব্যর্থ হয়েছে: ' + ((e && e.message) || ''), 'error');
+    showToast('স্টক যোগ করা যায়নি: ' + ((e && e.message) || ''), 'error');
   } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+    isSubmitting = false;
   }
 }
 
+/* ---------------- LEVEL 1 → LEVEL 2: admin/uno transfers central stock to a dealer ---------------- */
+function openTransferStockModal(dealerId) {
+  const dealers = state.dealers.filter(d => d.status !== 'inactive');
+  openModal(`
+    <h3>স্টক ট্রান্সফার করুন (অ্যাডমিন → ডিলার)</h3>
+    <p class="muted" style="margin-top:-6px;margin-bottom:12px;">কেন্দ্রীয় মজুদ থেকে নির্দিষ্ট ডিলারের নামে বরাদ্দ — কেন্দ্রীয় মজুদে পর্যাপ্ত না থাকলে ট্রান্সফার ব্লক হবে।</p>
+    <form id="transferStockForm">
+      <div class="field">
+        <label>ডিলার</label>
+        <select name="dealerId" ${dealerId ? 'disabled' : ''} required>
+          <option value="">-- নির্বাচন করুন --</option>
+          ${dealers.map(d => `<option value="${d.id}" ${d.id === dealerId ? 'selected' : ''}>${esc(d.name)} (${esc(d.union)})</option>`).join('')}
+        </select>
+        ${dealerId ? `<input type="hidden" name="dealerIdFixed" value="${esc(dealerId)}">` : ''}
+      </div>
+      <div class="field"><label>সারের নাম</label><select name="fertilizer" required><option value="">-- নির্বাচন করুন --</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}">${esc(f.l)}</option>`).join('')}</select></div>
+      <div id="transferStockCurrentInfo" class="muted" style="margin:-6px 0 14px;"></div>
+      <div class="form-grid cols-2">
+        <div class="field"><label>পরিমাণ (কেজি)</label><input type="number" name="quantity" min="0.5" step="0.5" required></div>
+        <div class="field"><label>তারিখ</label><input type="date" name="date" value="${todayStr()}" max="${todayStr()}" required></div>
+      </div>
+      <div class="field"><label>রেফারেন্স/নোট (ঐচ্ছিক)</label><input type="text" name="note" placeholder="যেমন: ১ম কিস্তি বরাদ্দ"></div>
+      <button type="submit" class="btn btn-primary" id="transferStockSubmitBtn" style="width:100%;">ট্রান্সফার করুন</button>
+    </form>
+  `);
+  updateTransferStockCurrentInfo();
+}
+// Live before/after preview — central available AND dealer's current stock,
+// reusing state.adminStock/state.allDealerStock that are already loaded (this
+// modal only ever opens from the Stock Management page, which loads both
+// first) — no extra Firebase read just to show this.
+function updateTransferStockCurrentInfo() {
+  const form = document.getElementById('transferStockForm');
+  const infoEl = document.getElementById('transferStockCurrentInfo');
+  if (!form || !infoEl) return;
+  const dealerId = form.dealerIdFixed ? form.dealerIdFixed.value : form.dealerId.value;
+  const fertilizer = form.fertilizer.value;
+  if (!fertilizer) { infoEl.textContent = ''; return; }
+  const central = normalizeAdminStockRow(state.adminStock[fertilizer]);
+  let html = `কেন্দ্রীয় মজুদ (বর্তমান): <b>${central.available.toLocaleString('bn-BD')} কেজি</b>`;
+  if (dealerId) {
+    const dealerRow = normalizeStockRow(state.allDealerStock[dealerId] && state.allDealerStock[dealerId][fertilizer]);
+    html += ` · ডিলারের বর্তমান মজুদ: ${dealerRow.available.toLocaleString('bn-BD')} কেজি`;
+  }
+  infoEl.innerHTML = html;
+}
+// ---- Admin(central) → Dealer transfer, two-phase, race-safe ----
+// adminStock/{fertilizer} and dealerStock/{dealerId}/{fertilizer} are two
+// separate Firebase paths — Realtime Database cannot validate-and-commit
+// both as a single transaction. So:
+//   Phase 1 — runTransaction reserves the quantity on adminStock/{fertilizer}
+//             ONLY (decrement available, increment allocated). This is the
+//             checked step: if central available can't cover the quantity
+//             at commit time, the transaction aborts and NOTHING is written
+//             anywhere — central stock can never go negative.
+//   Phase 2 — a SECOND runTransaction credits dealerStock/{dealerId}/{fertilizer}
+//             (unconditional — crediting a dealer never needs to be
+//             blocked). If this throws (network/Rules), Phase 1's
+//             reservation is rolled back with a reverse transaction on
+//             adminStock/{fertilizer} — so central stock is never left
+//             decremented without the dealer's stock having actually
+//             increased (exactly the invariant asked for).
+// Both stockHistory (dealer-side) and adminStockHistory (central-side) are
+// then appended as best-effort audit entries — the real numeric mutation
+// has already committed by that point either way.
+async function transferAdminStockToDealer(dealerId, dealerName, fertilizer, quantity, date, note) {
+  const adminStockRef = ref(db, `adminStock/${fertilizer}`);
+  let centralBefore = 0, centralAfter = 0;
+  const reserveResult = await runStockTransactionWithCacheWarmup(adminStockRef, (current) => {
+    const cur = normalizeAdminStockRow(current);
+    if (quantity > cur.available) return; // abort — insufficient central stock, nothing written
+    centralBefore = cur.available;
+    centralAfter = cur.available - quantity;
+    return { received: cur.received, allocated: cur.allocated + quantity, available: centralAfter };
+  });
+  if (!reserveResult.committed) {
+    const fresh = normalizeAdminStockRow((await dbGet(`adminStock/${fertilizer}`)));
+    const err = new Error(`কেন্দ্রীয় স্টক অপর্যাপ্ত — বর্তমান উপলব্ধ: ${fresh.available.toLocaleString('bn-BD')} কেজি`);
+    err.code = 'INSUFFICIENT_CENTRAL_STOCK';
+    throw err;
+  }
+  const dealerStockRef = ref(db, `dealerStock/${dealerId}/${fertilizer}`);
+  let dealerBefore = 0, dealerAfter = 0;
+  try {
+    const creditResult = await runTransaction(dealerStockRef, (current) => {
+      const cur = normalizeStockRow(current);
+      dealerBefore = cur.available;
+      dealerAfter = cur.available + quantity;
+      return { received: cur.received + quantity, distributed: cur.distributed, available: dealerAfter };
+    });
+    if (!creditResult.committed) throw new Error('ডিলারের স্টক আপডেট করা যায়নি');
+  } catch (e) {
+    // Phase 2 failed — roll back Phase 1's reservation so central stock is
+    // never left decremented without the dealer's stock increasing.
+    await runTransaction(adminStockRef, (current) => {
+      const cur = normalizeAdminStockRow(current);
+      return { received: cur.received, allocated: Math.max(0, cur.allocated - quantity), available: cur.available + quantity };
+    });
+    const err = new Error('ডিলারের স্টক আপডেট করা যায়নি — কেন্দ্রীয় স্টক রোলব্যাক করা হয়েছে, কিছুই ট্রান্সফার হয়নি');
+    err.code = 'DEALER_CREDIT_FAILED';
+    throw err;
+  }
+  // Both ledger entries are best-effort — the real mutation already committed above.
+  try {
+    await recordStockHistory(dealerId, {
+      dealerName, fertilizer, transactionType: 'STOCK_TRANSFER_IN', quantity,
+      previousStock: dealerBefore, newStock: dealerAfter, note, date: date || todayStr(),
+    });
+  } catch (e) { writeSystemLog('error', 'stock_history_failed', (e && e.message) || 'unknown'); }
+  try {
+    await recordAdminStockHistory({
+      fertilizer, transactionType: 'STOCK_TRANSFER_OUT', quantity,
+      previousStock: centralBefore, newStock: centralAfter, dealerId, dealerName, note, date: date || todayStr(),
+    });
+  } catch (e) { writeSystemLog('error', 'admin_stock_history_failed', (e && e.message) || 'unknown'); }
+  return { centralBefore, centralAfter, dealerBefore, dealerAfter };
+}
+async function handleTransferStockSubmit(form) {
+  if (isSubmitting) return;
+  if (!state.user || (state.user.role !== 'admin' && state.user.role !== 'uno')) { showToast('স্টক ট্রান্সফারের অনুমতি নেই', 'error'); return; }
+  const dealerId = form.dealerIdFixed ? form.dealerIdFixed.value : form.dealerId.value;
+  const fertilizer = form.fertilizer.value;
+  const quantity = parseFloat(form.quantity.value);
+  const date = form.date.value;
+  const note = form.note.value.trim();
+  if (!dealerId) { showToast('ডিলার নির্বাচন করুন', 'error'); return; }
+  if (!fertilizer) { showToast('সারের নাম নির্বাচন করুন', 'error'); return; }
+  if (!validateStockQuantity(quantity)) { showToast('সঠিক পরিমাণ দিন (০ এর বেশি)', 'error'); return; }
+  if (date && new Date(date) > new Date()) { showToast('ভবিষ্যতের তারিখ দেওয়া যাবে না', 'error'); return; }
+  const dealer = state.dealers.find(d => d.id === dealerId);
+  if (!dealer) { showToast('ডিলার পাওয়া যায়নি', 'error'); return; }
+  const centralAvailable = normalizeAdminStockRow(state.adminStock[fertilizer]).available;
+  if (quantity > centralAvailable) {
+    showToast(`কেন্দ্রীয় স্টকে পর্যাপ্ত ${fertilizerLabel(fertilizer)} নেই — উপলব্ধ: ${centralAvailable.toLocaleString('bn-BD')} কেজি, চাহিদা: ${quantity.toLocaleString('bn-BD')} কেজি`, 'error');
+    return; // client-side pre-check for instant feedback; the transaction below is still the final authority
+  }
+  isSubmitting = true;
+  const btn = document.getElementById('transferStockSubmitBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'ট্রান্সফার হচ্ছে...'; }
+  try {
+    const result = await transferAdminStockToDealer(dealerId, dealer.name, fertilizer, quantity, date, note);
+    showToast(`ট্রান্সফার সম্পন্ন — কেন্দ্রীয় মজুদ: ${result.centralAfter.toLocaleString('bn-BD')} কেজি, ${dealer.name}-এর মজুদ: ${result.dealerAfter.toLocaleString('bn-BD')} কেজি`, 'success');
+    writeSystemLog('data_entry', 'stock_transferred', `${dealer.name} — ${fertilizerLabel(fertilizer)} +${quantity} কেজি (কেন্দ্রীয় থেকে)`);
+    closeModal();
+    // No manual re-fetch here — subscribeDealerStockAdmin() (this modal only
+    // ever opens from the Stock Management page) and, for the dealer's own
+    // "আমার স্টক" page, subscribeMyStock() both push this update live.
+  } catch (e) {
+    showToast((e && e.message) || 'ট্রান্সফার করা যায়নি', 'error');
+    writeSystemLog('error', 'stock_transfer_failed', (e && e.message) || 'unknown');
+  } finally {
+    isSubmitting = false;
+  }
+}
+
+/* ---------------- ADMIN STOCK ADJUSTMENT (Main Admin only) — V9 ----------------
+   Lets the Main Admin INCREASE or DECREASE stock at either level, always
+   through a Firebase transaction and always keeping the two balance
+   formulas the Rules/.validate and computeStockIntegrityIssues rely on:
+     central: received − allocated  = available
+     dealer : received − distributed = available
+   Operations:
+     Central + / −      → adjusts central received + available (e.g. a receipt
+                          entered wrong, damaged/short-weight bags). A decrease
+                          can never take available below 0.
+     Dealer + (central) → the existing transferAdminStockToDealer() — kg moves
+                          out of the central pool (unchanged code path).
+     Dealer − (central) → "return to central": dealer received/available go
+                          down, central allocated goes down + available goes up.
+                          Two transactions; if the second fails, the first is
+                          rolled back (same pattern as the transfer).
+     Dealer ± (direct)  → correction on the dealer only (count error, damage),
+                          central untouched. Decrease never below available.
+   Distributed quantities are NEVER touched here — those only change through
+   real distribution records (and their deletion).
+   Every change needs a written reason and lands in: the ledger
+   (stockHistory/{dealer} as STOCK_ADJUSTMENT with previous/new stock, and/or
+   adminStockHistory as CENTRAL_STOCK_ADJUSTMENT) + systemLogs. */
+function adjustTargetLabel(target) {
+  if (target === 'central') return 'কেন্দ্রীয়/উপজেলা স্টক';
+  const d = state.dealers.find(x => x.id === target);
+  return d ? `${d.name} (${d.union || ''})` : target;
+}
+async function openStockAdjustModal(target) {
+  if (!state.user || state.user.role !== 'admin') { showToast('শুধু Main Admin স্টক সমন্বয় করতে পারবেন', 'error'); return; }
+  const isCentral = target === 'central';
+  openModal(`
+    <h3>স্টক সমন্বয় — ${esc(adjustTargetLabel(target))}</h3>
+    <p class="muted" style="margin-top:-6px;margin-bottom:12px;">স্টক বাড়ান বা কমান। বিতরণকৃত পরিমাণ এখানে পরিবর্তন হয় না — সেটা শুধু বিতরণ রেকর্ড থেকে আসে। কারণ লেখা বাধ্যতামূলক; সব পরিবর্তন লেজার ও সিস্টেম লগে থাকবে।</p>
+    <form id="stockAdjustForm" data-target="${esc(target)}">
+      <div class="field"><label>সারের নাম</label><select name="fertilizer" required><option value="">-- নির্বাচন করুন --</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}">${esc(f.l)}</option>`).join('')}</select></div>
+      <div class="form-grid cols-2">
+        <div class="field"><label>ধরন</label><select name="direction" required><option value="in">বাড়ান (+)</option><option value="out">কমান (−)</option></select></div>
+        ${isCentral ? '<input type="hidden" name="method" value="central">' : `<div class="field"><label>পদ্ধতি</label><select name="method" required><option value="central">কেন্দ্রীয় মজুদের সাথে</option><option value="direct">সরাসরি সংশোধন</option></select></div>`}
+      </div>
+      <div class="form-grid cols-2">
+        <div class="field"><label>পরিমাণ (কেজি)</label><input type="number" name="quantity" min="0.5" step="0.5" required></div>
+        <div class="field"><label>তারিখ</label><input type="date" name="date" value="${todayStr()}" max="${todayStr()}" required></div>
+      </div>
+      <div class="field"><label>কারণ (বাধ্যতামূলক)</label><input type="text" name="reason" required maxlength="200" placeholder="যেমন: গণনার ভুল সংশোধন, নষ্ট বস্তা, ফেরত"></div>
+      <p class="muted" style="margin:-6px 0 10px;font-size:12px;">${isCentral ? 'বাড়ালে/কমালে কেন্দ্রীয় "মোট গৃহীত" ও "মজুদ" সমান পরিমাণে বদলাবে।' : '"কেন্দ্রীয় মজুদের সাথে": বাড়ালে কেন্দ্রীয় মজুদ থেকে ট্রান্সফার, কমালে কেন্দ্রীয় মজুদে ফেরত। "সরাসরি সংশোধন": শুধু ডিলারের স্টক (গণনার ভুল/নষ্ট সার)।'}</p>
+      <div id="stockAdjustPreview" class="farmer-status" style="margin:4px 0 14px;">সার ও পরিমাণ নির্বাচন করুন।</div>
+      <button type="submit" class="btn btn-primary" id="stockAdjustSubmitBtn" style="width:100%;">সমন্বয় সংরক্ষণ করুন</button>
+    </form>`);
+  // Fresh read of just the rows involved (tiny) so the preview never relies
+  // on a stale or not-yet-subscribed listener.
+  try {
+    const [central, dealer] = await Promise.all([dbGet('adminStock'), isCentral ? Promise.resolve(null) : dbGet(`dealerStock/${target}`)]);
+    state.adminStock = central || {};
+    if (!isCentral) state.allDealerStock[target] = dealer || {};
+  } catch (e) { /* preview falls back to whatever is loaded */ }
+  updateStockAdjustPreview();
+}
+function readStockAdjustForm(form) {
+  const target = form.dataset.target;
+  return {
+    target, isCentral: target === 'central',
+    fertilizer: form.fertilizer.value,
+    direction: form.direction.value,
+    method: form.method ? form.method.value : 'central',
+    quantity: parseFloat(normalizeBanglaDigits(form.quantity.value)),
+    date: form.date.value,
+    reason: (form.reason.value || '').trim(),
+  };
+}
+function updateStockAdjustPreview() {
+  const form = document.getElementById('stockAdjustForm');
+  const box = document.getElementById('stockAdjustPreview');
+  if (!form || !box) return;
+  const v = readStockAdjustForm(form);
+  if (!v.fertilizer) { box.className = 'farmer-status'; box.innerHTML = 'সার ও পরিমাণ নির্বাচন করুন।'; return; }
+  const q = validateStockQuantity(v.quantity) ? v.quantity : 0;
+  const sign = v.direction === 'out' ? -1 : 1;
+  const c = normalizeAdminStockRow(state.adminStock[v.fertilizer]);
+  let html = '', bad = '';
+  if (v.isCentral) {
+    const after = c.available + sign * q;
+    if (after < 0) bad = `কেন্দ্রীয় মজুদে মাত্র ${kgFmt(c.available)} কেজি আছে — এর বেশি কমানো যাবে না।`;
+    html = `কেন্দ্রীয় মজুদ: <b>${kgFmt(c.available)}</b> → <b>${kgFmt(after)}</b> কেজি · মোট গৃহীত: ${kgFmt(c.received)} → ${kgFmt(c.received + sign * q)}`;
+  } else {
+    const d = normalizeStockRow(state.allDealerStock[v.target] && state.allDealerStock[v.target][v.fertilizer]);
+    const dAfter = d.available + sign * q;
+    if (dAfter < 0) bad = `ডিলারের মজুদে মাত্র ${kgFmt(d.available)} কেজি আছে — এর বেশি কমানো যাবে না (বিতরণকৃত সার কমানো যায় না)।`;
+    html = `ডিলারের মজুদ: <b>${kgFmt(d.available)}</b> → <b>${kgFmt(dAfter)}</b> কেজি`;
+    if (v.method === 'central') {
+      const cAfter = c.available - sign * q;
+      if (sign > 0 && cAfter < 0) bad = `কেন্দ্রীয় মজুদে মাত্র ${kgFmt(c.available)} কেজি আছে — ট্রান্সফার করা যাবে না।`;
+      html += ` · কেন্দ্রীয় মজুদ: ${kgFmt(c.available)} → ${kgFmt(cAfter)} কেজি`;
+    } else {
+      html += ' · কেন্দ্রীয় মজুদ অপরিবর্তিত';
+    }
+  }
+  box.className = 'farmer-status ' + (bad ? 'blocked' : 'ok');
+  box.innerHTML = html + (bad ? `<div style="color:var(--danger);font-weight:700;">${bad}</div>` : '');
+  const btn = document.getElementById('stockAdjustSubmitBtn');
+  if (btn && !isSubmitting) btn.disabled = !!bad; // the transaction re-checks anyway
+}
+async function adjustCentralStock(fertilizer, delta, date, reason) {
+  const stockRef = ref(db, `adminStock/${fertilizer}`);
+  let before = 0, after = 0, shortfall = null;
+  const tx = await runStockTransactionWithCacheWarmup(stockRef, (current) => {
+    const cur = normalizeAdminStockRow(current);
+    shortfall = null;
+    if (delta < 0 && -delta > cur.available + 1e-9) { shortfall = cur.available; return undefined; }
+    before = cur.available; after = cur.available + delta;
+    return { received: cur.received + delta, allocated: cur.allocated, available: after };
+  });
+  if (!tx.committed) throw new Error(shortfall !== null ? `কেন্দ্রীয় মজুদ অপর্যাপ্ত — উপলব্ধ ${kgFmt(shortfall)} কেজি` : 'কেন্দ্রীয় স্টক আপডেট করা যায়নি');
+  try {
+    await recordAdminStockHistory({ fertilizer, transactionType: 'CENTRAL_STOCK_ADJUSTMENT', quantity: Math.abs(delta), previousStock: before, newStock: after, note: `অ্যাডমিন সমন্বয় (${delta > 0 ? '+' : '−'}) — ${reason}`, date });
+  } catch (e) { writeSystemLog('error', 'admin_stock_history_failed', (e && e.message) || 'unknown'); }
+  return { before, after };
+}
+async function adjustDealerStockDirect(dealerId, dealerName, fertilizer, delta, date, note) {
+  const stockRef = ref(db, `dealerStock/${dealerId}`);
+  let before = 0, after = 0, shortfall = null;
+  const tx = await runStockTransactionWithCacheWarmup(stockRef, (current) => {
+    shortfall = null;
+    const node = Object.assign({}, current || {});
+    const row = normalizeStockRow(node[fertilizer]);
+    if (delta < 0 && -delta > row.available + 1e-9) { shortfall = row.available; return undefined; }
+    before = row.available; after = row.available + delta;
+    node[fertilizer] = { received: row.received + delta, distributed: row.distributed, available: after };
+    return node;
+  });
+  if (!tx.committed) throw new Error(shortfall !== null ? `ডিলারের মজুদ অপর্যাপ্ত — উপলব্ধ ${kgFmt(shortfall)} কেজি` : 'ডিলারের স্টক আপডেট করা যায়নি');
+  try {
+    await recordStockHistory(dealerId, { dealerName, fertilizer, transactionType: 'STOCK_ADJUSTMENT', quantity: Math.abs(delta), previousStock: before, newStock: after, note, date });
+  } catch (e) { writeSystemLog('error', 'stock_history_failed', (e && e.message) || 'unknown'); }
+  return { before, after };
+}
+async function returnDealerStockToCentral(dealerId, dealerName, fertilizer, qty, date, reason) {
+  // Phase 1 — checked: take the kg off the dealer (aborts if not available).
+  const d = await adjustDealerStockDirect(dealerId, dealerName, fertilizer, -qty, date, `কেন্দ্রীয় মজুদে ফেরত — ${reason}`);
+  // Phase 2 — credit central: allocated down, available up (formula kept
+  // even for legacy rows where allocated < qty).
+  let cBefore = 0, cAfter = 0;
+  try {
+    const tx = await runStockTransactionWithCacheWarmup(ref(db, `adminStock/${fertilizer}`), (current) => {
+      const cur = normalizeAdminStockRow(current);
+      cBefore = cur.available; cAfter = cur.available + qty;
+      const allocated = Math.max(0, cur.allocated - qty);
+      return { received: cAfter + allocated, allocated, available: cAfter };
+    });
+    if (!tx.committed) throw new Error('কেন্দ্রীয় স্টক আপডেট করা যায়নি');
+  } catch (e) {
+    // Roll phase 1 back so kg never disappears from both levels.
+    await adjustDealerStockDirect(dealerId, dealerName, fertilizer, qty, date, `রোলব্যাক — কেন্দ্রীয় মজুদে ফেরত ব্যর্থ (${reason})`);
+    throw new Error('কেন্দ্রীয় মজুদে ফেরত দেওয়া যায়নি — ডিলারের স্টক আগের অবস্থায় ফেরানো হয়েছে');
+  }
+  try {
+    await recordAdminStockHistory({ fertilizer, transactionType: 'CENTRAL_STOCK_ADJUSTMENT', quantity: qty, previousStock: cBefore, newStock: cAfter, dealerId, dealerName, note: `ডিলার থেকে ফেরত — ${reason}`, date });
+  } catch (e) { writeSystemLog('error', 'admin_stock_history_failed', (e && e.message) || 'unknown'); }
+  return { dealerBefore: d.before, dealerAfter: d.after, centralBefore: cBefore, centralAfter: cAfter };
+}
+async function handleStockAdjustSubmit(form) {
+  if (isSubmitting) return;
+  if (state.user.role !== 'admin') { showToast('শুধু Main Admin স্টক সমন্বয় করতে পারবেন', 'error'); return; }
+  const v = readStockAdjustForm(form);
+  if (!v.fertilizer) { showToast('সারের নাম নির্বাচন করুন', 'error'); return; }
+  if (!validateStockQuantity(v.quantity)) { showToast('সঠিক পরিমাণ দিন (০ এর বেশি)', 'error'); return; }
+  if (!v.date || v.date > todayStr()) { showToast('সঠিক তারিখ দিন (ভবিষ্যৎ নয়)', 'error'); return; }
+  if (v.reason.length < 3) { showToast('সমন্বয়ের কারণ লিখুন', 'error'); return; }
+  const dealer = v.isCentral ? null : state.dealers.find(x => x.id === v.target);
+  if (!v.isCentral && !dealer) { showToast('ডিলার পাওয়া যায়নি', 'error'); return; }
+  isSubmitting = true;
+  const btn = document.getElementById('stockAdjustSubmitBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'সংরক্ষণ হচ্ছে...'; }
+  const sign = v.direction === 'out' ? -1 : 1;
+  const what = `${fertilizerLabel(v.fertilizer)} ${sign > 0 ? '+' : '−'}${v.quantity} কেজি`;
+  try {
+    let msg = '';
+    if (v.isCentral) {
+      const r = await adjustCentralStock(v.fertilizer, sign * v.quantity, v.date, v.reason);
+      msg = `কেন্দ্রীয় মজুদ: ${kgFmt(r.before)} → ${kgFmt(r.after)} কেজি`;
+      writeSystemLog('data_entry', 'central_stock_adjusted', `${what} | কারণ: ${v.reason}`);
+    } else if (v.method === 'direct') {
+      const r = await adjustDealerStockDirect(dealer.id, dealer.name, v.fertilizer, sign * v.quantity, v.date, `অ্যাডমিন সমন্বয় (${sign > 0 ? '+' : '−'}) — ${v.reason}`);
+      msg = `${dealer.name}-এর মজুদ: ${kgFmt(r.before)} → ${kgFmt(r.after)} কেজি`;
+      writeSystemLog('data_entry', 'dealer_stock_adjusted', `${dealer.name} (${dealer.id}) | ${what} | সরাসরি | কারণ: ${v.reason}`);
+    } else if (sign > 0) {
+      const r = await transferAdminStockToDealer(dealer.id, dealer.name, v.fertilizer, v.quantity, v.date, v.reason);
+      msg = `ট্রান্সফার — কেন্দ্রীয়: ${kgFmt(r.centralAfter)} কেজি, ${dealer.name}: ${kgFmt(r.dealerAfter)} কেজি`;
+      writeSystemLog('data_entry', 'stock_transferred', `${dealer.name} — ${what} (কেন্দ্রীয় থেকে) | কারণ: ${v.reason}`);
+    } else {
+      const r = await returnDealerStockToCentral(dealer.id, dealer.name, v.fertilizer, v.quantity, v.date, v.reason);
+      msg = `ফেরত — ${dealer.name}: ${kgFmt(r.dealerAfter)} কেজি, কেন্দ্রীয়: ${kgFmt(r.centralAfter)} কেজি`;
+      writeSystemLog('data_entry', 'dealer_stock_returned', `${dealer.name} (${dealer.id}) | ${what} → কেন্দ্রীয় | কারণ: ${v.reason}`);
+    }
+    closeModal();
+    showToast('সমন্বয় সম্পন্ন — ' + msg, 'success');
+    if (!v.isCentral) { try { state.allDealerStock[dealer.id] = (await dbGet(`dealerStock/${dealer.id}`)) || {}; } catch (e) { /* listener/page reload will refresh */ } }
+    if (currentView === 'dealerAudit' && state.audit.dealerId) loadDealerAudit(state.audit.dealerId);
+    else renderCurrentView();
+  } catch (e) {
+    showToast((e && e.message) || 'সমন্বয় করা যায়নি', 'error');
+    writeSystemLog('error', 'stock_adjust_failed', `${adjustTargetLabel(v.target)} | ${what} | ${(e && e.message) || 'unknown'}`);
+    if (btn) { btn.disabled = false; btn.textContent = 'সমন্বয় সংরক্ষণ করুন'; }
+  } finally {
+    isSubmitting = false;
+  }
+}
+// Central ledger (adminStockHistory) — was written since Index 41 but never
+// shown anywhere. Bounded: latest 100 by key.
+async function openCentralStockHistoryModal() {
+  openModal(`<h3>কেন্দ্রীয় স্টক লেনদেনের ইতিহাস (সাম্প্রতিক ১০০টি)</h3><div id="centralHistoryBody"><div class="loading">তথ্য লোড হচ্ছে...</div></div>`);
+  let html;
+  try {
+    const rows = snapToOrderedArray(await get(query(ref(db, 'adminStockHistory'), orderByKey(), limitToLast(100)))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    html = rows.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>তারিখ</th><th>সার</th><th>ধরন</th><th>পরিমাণ</th><th>আগের</th><th>নতুন</th><th>ডিলার</th><th>যিনি করেছেন</th><th>মন্তব্য</th></tr></thead><tbody>${rows.map(r => `<tr><td>${ddmmyyyy(r.date)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${esc(STOCK_TX_TYPES[r.transactionType] || r.transactionType)}</td><td>${ledgerQtyLabel(r)}</td><td>${esc(r.previousStock ?? '-')}</td><td>${esc(r.newStock ?? '-')}</td><td>${esc(r.dealerName || '-')}</td><td>${esc(r.addedByName || '-')}</td><td>${dashIfEmpty(r.note)}</td></tr>`).join('')}</tbody></table></div>` : emptyState('এখনো কোনো কেন্দ্রীয় লেনদেন নেই।');
+  } catch (e) { html = `<div class="db-error">${esc((e && e.message) || 'লোড করা যায়নি')}</div>`; }
+  const body = document.getElementById('centralHistoryBody');
+  if (body) body.innerHTML = html;
+}
+
+state.audit = emptyAuditState();
+/* =========================================================================
+   DEALER AUDIT / DEALER PROFILE (admin + UNO) — V8
+   =========================================================================
+   Everything here is DEALER-SCOPED — never the global distributions table:
+     - totals: dashboardStats/dealerStats/{id}/totalDistributions|totalFertilizer
+       and dashboardStats/dealers/{id} (two independent counters, compared)
+     - stock: dealerStock/{id} (received / distributed / available — the
+       existing stock meaning, unchanged)
+     - today's distributions: exact dealerDateKey == `${id}_${today}` query
+     - today's received/allocated: stockHistory/{id} entries CREATED today
+       (orderByKey + push-key time prefix — no .indexOn needed) whose
+       transactionType is STOCK_TRANSFER_IN; DISTRIBUTION and
+       STOCK_ADJUSTMENT are kept separate exactly as the ledger records them
+     - recent: the dealer's latest 50 records (dealerId index, limitToLast)
+     - ledger: the dealer's latest 100 stock transactions
+     - fertilizer-wise KG from the RECORDS (not only the stock ledger) is an
+       explicit button — a batched scan bounded by THIS dealer's own records.
+   ========================================================================= */
+function emptyAuditState() {
+  return {
+    unionFilter: '', dealerId: '', loading: false, error: null,
+    stock: {}, totals: null, todayRows: [], todayLedger: [], recent: [], recentPage: 1,
+    ledger: [], dupCount: null, dupCapped: false, scan: null, scanning: false, scanProgress: '',
+    dateFrom: '', dateTo: '', exporting: false, loadedAt: 0,
+  };
+}
+let auditSeq = 0;
+function openDealerAudit(dealerId) {
+  const d = state.dealers.find(x => x.id === dealerId);
+  state.audit = { ...emptyAuditState(), unionFilter: d ? (d.union || '') : '', dealerId: dealerId || '' };
+  navigateTo('dealerAudit');
+}
+async function loadDealerAudit(dealerId) {
+  const a = state.audit;
+  const seq = ++auditSeq;
+  a.loading = true; a.error = null; a.scan = null;
+  renderCurrentView();
+  const today = todayStr();
+  try {
+    const base = ref(db, 'distributions');
+    const [stock, td, tf, cnt, todaySnap, recentSnap, ledgerSnap, todayLedgerSnap, dupSnap] = await Promise.all([
+      dbGet(`dealerStock/${dealerId}`),
+      dbGet(`dashboardStats/dealerStats/${dealerId}/totalDistributions`),
+      dbGet(`dashboardStats/dealerStats/${dealerId}/totalFertilizer`),
+      dbGet(`dashboardStats/dealers/${dealerId}`),
+      get(query(base, orderByChild('dealerDateKey'), equalTo(`${dealerId}_${today}`))),
+      get(query(base, orderByChild('dealerId'), equalTo(dealerId), limitToLast(50))),
+      get(query(ref(db, `stockHistory/${dealerId}`), orderByKey(), limitToLast(100))),
+      get(query(ref(db, `stockHistory/${dealerId}`), orderByKey(), startAt(pushKeyPrefixForTime(startOfLocalDayMs(today))))),
+      get(query(ref(db, 'duplicateAttempts'), orderByChild('dealerId'), equalTo(dealerId), limitToLast(500))),
+    ]);
+    if (seq !== auditSeq || a.dealerId !== dealerId) return;
+    a.stock = stock || {};
+    a.totals = { totalDistributions: Number(td) || 0, totalFertilizer: Number(tf) || 0, dealersCounter: Number(cnt) || 0 };
+    a.todayRows = snapToOrderedArray(todaySnap);
+    a.recent = snapToOrderedArray(recentSnap).sort(distRowDescCompare);
+    a.recentPage = 1;
+    a.ledger = snapToOrderedArray(ledgerSnap).sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
+    a.todayLedger = snapToOrderedArray(todayLedgerSnap).filter(e => e.date === today);
+    const dups = snapToOrderedArray(dupSnap);
+    a.dupCount = dups.length; a.dupCapped = dups.length >= 500;
+    a.loadedAt = Date.now();
+  } catch (e) {
+    if (seq !== auditSeq) return;
+    a.error = (e && e.message) || 'ডিলারের তথ্য লোড করা যায়নি';
+    console.error('[FDMS] loadDealerAudit failed', e);
+  }
+  a.loading = false;
+  renderCurrentView();
+}
+function auditFertAgg(rows, qtyField) {
+  const out = {};
+  FERTILIZERS.forEach(f => { out[f.v] = { count: 0, kg: 0 }; });
+  (rows || []).forEach(r => {
+    const k = r.fertilizer;
+    if (!out[k]) out[k] = { count: 0, kg: 0 };
+    out[k].count++;
+    out[k].kg += parseFloat(normalizeBanglaDigits(r[qtyField || 'quantity'])) || 0;
+  });
+  return out;
+}
+async function runDealerAuditRecordScan() {
+  const a = state.audit;
+  if (!a.dealerId || a.scanning) return;
+  const dealerId = a.dealerId;
+  a.scanning = true; a.scanProgress = 'শুরু হচ্ছে...';
+  renderCurrentView();
+  const byFert = {};
+  FERTILIZERS.forEach(f => { byFert[f.v] = { count: 0, kg: 0 }; });
+  let total = 0, kg = 0, first = '', last = '', badQty = 0;
+  try {
+    await iterateDistScope({ kind: 'index', field: 'dealerId', value: dealerId, predicate: null }, (rows) => {
+      rows.forEach(r => {
+        const q = parseFloat(normalizeBanglaDigits(r.quantity)) || 0;
+        if (!(q > 0)) badQty++;
+        const k = r.fertilizer;
+        if (!byFert[k]) byFert[k] = { count: 0, kg: 0 };
+        byFert[k].count++; byFert[k].kg += q;
+        total++; kg += q;
+        const d = String(r.date || '');
+        if (d && (!first || d < first)) first = d;
+        if (d && (!last || d > last)) last = d;
+      });
+    }, (matched) => {
+      if (state.audit.dealerId !== dealerId) return;
+      a.scanProgress = `${matched.toLocaleString('bn-BD')} টি রেকর্ড পড়া হয়েছে...`;
+      if (currentView === 'dealerAudit') renderCurrentView();
+    }, () => state.audit.dealerId !== dealerId);
+    if (state.audit.dealerId === dealerId) a.scan = { byFert, total, kg, first, last, badQty, at: Date.now() };
+  } catch (e) {
+    if (state.audit.dealerId === dealerId) showToast('হিসাব করা যায়নি: ' + ((e && e.message) || ''), 'error');
+  }
+  a.scanning = false; a.scanProgress = '';
+  renderCurrentView();
+}
+function renderDealerAudit() {
+  const a = state.audit;
+  const dealers = dealersForUnion(a.unionFilter);
+  const d = state.dealers.find(x => x.id === a.dealerId);
+  const selector = `
+    <div class="glass-card filter-bar" style="margin-bottom:16px;">
+      <div class="field"><label>ইউনিয়ন</label><select data-audit-union><option value="">সকল</option>${UNIONS.map(u => `<option value="${esc(u)}" ${a.unionFilter === u ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
+      <div class="field" style="grid-column:span 2;"><label>ডিলার${a.unionFilter ? ' <span class="muted" style="font-weight:500;">(এই ইউনিয়নের)</span>' : ''}</label><select data-audit-dealer><option value="">-- ডিলার নির্বাচন করুন --</option>${dealers.map(x => `<option value="${esc(x.id)}" ${a.dealerId === x.id ? 'selected' : ''}>${esc(x.name)} (${esc(x.union || '')})${x.status === 'inactive' ? ' — নিষ্ক্রিয়' : ''}</option>`).join('')}</select></div>
+    </div>`;
+  const header = `<div class="page-header"><h2>ডিলার অডিট / প্রোফাইল</h2>${d ? `<div style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" data-action="audit-reload" ${a.loading ? 'disabled' : ''}>↻ রিফ্রেশ</button><button class="btn btn-outline btn-sm" data-action="audit-view-all-records">সম্পূর্ণ বিতরণ ইতিহাস</button></div>` : ''}</div>`;
+  if (!d) return `${header}${selector}<div class="glass-card">${emptyState(a.dealerId ? 'ডিলার পাওয়া যায়নি।' : 'ইউনিয়ন ও ডিলার নির্বাচন করুন — নির্বাচিত ডিলারের বিতরণ, স্টক ও অডিট তথ্য এখানে দেখা যাবে।')}</div>`;
+  if (a.loading && !a.totals) return `${header}${selector}<div class="loading">তথ্য লোড হচ্ছে...</div>`;
+  if (a.error) return `${header}${selector}<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(a.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="audit-reload">আবার চেষ্টা করুন</button></div></div>`;
+  const today = todayStr();
+  const t = a.totals || { totalDistributions: 0, totalFertilizer: 0, dealersCounter: 0 };
+  const todayAgg = auditFertAgg(a.todayRows);
+  const todayKg = Object.values(todayAgg).reduce((s, v) => s + v.kg, 0);
+  const ledgerToday = {};
+  FERTILIZERS.forEach(f => { ledgerToday[f.v] = { received: 0, distributed: 0, adjusted: 0 }; });
+  a.todayLedger.forEach(e => {
+    const row = ledgerToday[e.fertilizer] || (ledgerToday[e.fertilizer] = { received: 0, distributed: 0, adjusted: 0 });
+    const q = Number(e.quantity) || 0;
+    if (e.transactionType === 'STOCK_TRANSFER_IN') row.received += q;
+    else if (e.transactionType === 'DISTRIBUTION') row.distributed += q;
+    else if (e.transactionType === 'STOCK_ADJUSTMENT') row.adjusted += ledgerSignedQty(e);
+  });
+  const counterMismatch = t.dealersCounter !== t.totalDistributions;
+  const lastDate = a.recent.length ? a.recent[0].date : '';
+  const stockRows = FERTILIZERS.map(f => {
+    const s = normalizeStockRow(a.stock[f.v]);
+    const bad = s.available < -0.001 || Math.abs((s.received - s.distributed) - s.available) > 0.001;
+    return `<tr><td>${esc(f.l)}</td><td>${kgFmt(ledgerToday[f.v].received)}</td><td>${kgFmt(s.received)}</td><td>${kgFmt(s.distributed)}</td><td>${kgFmt(todayAgg[f.v].kg)} <span class="muted">(${todayAgg[f.v].count})</span></td><td><span class="badge ${s.available <= 0 ? 'badge-red' : 'badge-green'}">${kgFmt(s.available)} কেজি</span></td><td>${bad ? '<span class="badge badge-red">গরমিল</span>' : '<span class="badge badge-green">ঠিক আছে</span>'}</td></tr>`;
+  }).join('');
+  const scan = a.scan;
+  const scanHtml = a.scanning ? `<div class="loading">${esc(a.scanProgress || 'হিসাব চলছে...')}</div>`
+    : scan ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>সার</th><th>এন্ট্রি (রেকর্ড)</th><th>কেজি (রেকর্ড)</th><th>বিতরণকৃত (স্টক লেজার)</th><th>পার্থক্য</th></tr></thead><tbody>${Object.keys(scan.byFert).map(k => {
+        const r = scan.byFert[k]; const led = normalizeStockRow(a.stock[k]).distributed; const diff = r.kg - led;
+        return `<tr><td>${esc(fertilizerLabel(k))}</td><td>${r.count.toLocaleString('bn-BD')}</td><td>${kgFmt(r.kg)}</td><td>${kgFmt(led)}</td><td class="${Math.abs(diff) > 0.001 ? 'diff-neg' : ''}">${kgFmt(diff)}</td></tr>`;
+      }).join('')}<tr><td><b>মোট</b></td><td><b>${scan.total.toLocaleString('bn-BD')}</b></td><td><b>${kgFmt(scan.kg)}</b></td><td colspan="2" class="muted">ড্যাশবোর্ড কাউন্টার: ${t.totalDistributions.toLocaleString('bn-BD')} এন্ট্রি / ${kgFmt(t.totalFertilizer)} কেজি ${scan.total === t.totalDistributions && Math.abs(scan.kg - t.totalFertilizer) <= 0.01 ? '<span class="badge badge-green">মিলেছে</span>' : '<span class="badge badge-red">মেলেনি — Reconcile প্রয়োজন</span>'}</td></tr></tbody></table></div>
+      <p class="muted" style="margin:8px 0 0;font-size:12px;">প্রথম বিতরণ: ${ddmmyyyy(scan.first)} · সর্বশেষ: ${ddmmyyyy(scan.last)}${scan.badQty ? ` · ${scan.badQty} টি রেকর্ডে পরিমাণ অবৈধ/শূন্য` : ''}. স্টক লেজার চালুর আগের পুরনো বিতরণ লেজারে থাকে না, তাই "পার্থক্য" ইতিবাচক হতে পারে।</p>`
+    : `<p class="muted" style="margin:0 0 10px;">রেকর্ড থেকে সার-ভিত্তিক এন্ট্রি ও কেজি হিসাব (শুধু এই ডিলারের রেকর্ড, ব্যাচে পড়া হয় — ${t.totalDistributions.toLocaleString('bn-BD')} টি রেকর্ড)।</p><button class="btn btn-primary btn-sm" data-action="audit-scan-records">রেকর্ড থেকে হিসাব করুন</button>`;
+  const recent = a.recent;
+  const rp = Math.min(Math.max(1, a.recentPage), Math.max(1, Math.ceil(recent.length / PAGE_SIZE)));
+  a.recentPage = rp;
+  const recentRows = recent.slice((rp - 1) * PAGE_SIZE, rp * PAGE_SIZE);
+  return `${header}${selector}
+    <div class="audit-grid">
+      <div class="glass-card"><h3 style="margin-bottom:8px;">ডিলারের তথ্য</h3><div class="info-list">
+        <div><b>নাম:</b> ${esc(d.name)}</div><div><b>ডিলার আইডি:</b> <span style="font-family:monospace;font-size:12.5px;">${esc(d.id)}</span></div>
+        <div><b>মোবাইল:</b> ${esc(d.mobile || '-')}</div><div><b>ইমেইল:</b> ${esc(d.email || '-')}</div>
+        <div><b>ইউনিয়ন:</b> ${esc(d.union || '-')}</div><div><b>এলাকা:</b> ${esc(d.area || '-')}</div>
+        <div><b>স্ট্যাটাস:</b> ${d.status === 'inactive' ? '<span class="badge badge-red">নিষ্ক্রিয়</span>' : '<span class="badge badge-green">সক্রিয়</span>'}</div>
+        <div><b>যুক্ত হয়েছেন:</b> ${d.createdAt ? new Date(d.createdAt).toLocaleDateString('bn-BD') : '-'}</div>
+      </div></div>
+      <div class="glass-card"><h3 style="margin-bottom:8px;">অডিট তথ্য</h3><div class="info-list">
+        <div><b>সর্বশেষ বিতরণ:</b> ${lastDate ? ddmmyyyy(lastDate) : '-'}</div>
+        <div><b>ডুপ্লিকেট চেষ্টা:</b> ${a.dupCount === null ? '-' : `${a.dupCount.toLocaleString('bn-BD')}${a.dupCapped ? '+' : ''}`}</div>
+        <div><b>বিতরণ কাউন্টার যাচাই:</b> ${counterMismatch ? `<span class="badge badge-red">মেলেনি (${t.dealersCounter} বনাম ${t.totalDistributions})</span>` : '<span class="badge badge-green">দুইটি কাউন্টার মিলেছে</span>'}</div>
+        <div><b>তথ্য লোড:</b> ${a.loadedAt ? new Date(a.loadedAt).toLocaleString('bn-BD') : '-'}</div>
+      </div></div>
+    </div>
+    <div class="stat-grid">
+      ${statCard('মোট বিতরণ (এন্ট্রি)', t.totalDistributions.toLocaleString('bn-BD'), 'distribute')}
+      ${statCard('মোট সার বিতরণ (কেজি)', kgFmt(t.totalFertilizer), 'bag', 'gold')}
+      ${statCard(`আজকের বিতরণ (${ddmmyyyy(today)})`, `${a.todayRows.length.toLocaleString('bn-BD')} <span style="font-size:14px;font-weight:600;">/ ${kgFmt(todayKg)} কেজি</span>`, 'history')}
+      ${statCard('ডুপ্লিকেট চেষ্টা', a.dupCount === null ? '-' : a.dupCount + (a.dupCapped ? '+' : ''), 'duplicate', 'danger')}
+    </div>
+    <div class="glass-card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:4px;">স্টক অডিট — সার অনুযায়ী</h3>
+      <p class="muted" style="margin:0 0 10px;font-size:12.5px;">আজ প্রাপ্ত/বরাদ্দ = আজ তৈরি "স্টক ট্রান্সফার (অ্যাডমিন থেকে)" লেনদেন; মোট প্রাপ্ত/বিতরণকৃত/মজুদ = dealerStock (বর্তমান অবস্থা); আজ বিতরণ = আজকের বিতরণ রেকর্ড (বন্ধনীতে এন্ট্রি)।</p>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>সার</th><th>আজ প্রাপ্ত/বরাদ্দ</th><th>মোট প্রাপ্ত</th><th>মোট বিতরণকৃত</th><th>আজ বিতরণ</th><th>মজুদ (Available)</th><th>সূত্র যাচাই</th></tr></thead><tbody>${stockRows}</tbody></table></div>
+      ${a.todayLedger.some(e => e.transactionType === 'STOCK_ADJUSTMENT') ? `<p class="muted" style="margin:8px 0 0;font-size:12px;">আজ স্টক সমন্বয় (অ্যাডমিন সমন্বয় / রেকর্ড মুছে স্টক ফেরত): ${FERTILIZERS.filter(f => ledgerToday[f.v].adjusted).map(f => `${esc(f.v)} ${ledgerToday[f.v].adjusted >= 0 ? '+' : '−'}${kgFmt(Math.abs(ledgerToday[f.v].adjusted))} কেজি`).join(', ')}</p>` : ''}
+      ${state.user.role === 'admin' ? `<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" data-action="open-stock-adjust" data-target="${esc(d.id)}">± স্টক সমন্বয়</button><button class="btn btn-outline btn-sm" data-action="open-transfer-stock" data-dealer-id="${esc(d.id)}">কেন্দ্রীয় থেকে ট্রান্সফার</button></div>` : ''}
+    </div>
+    <div class="glass-card" style="margin-bottom:16px;"><h3 style="margin-bottom:8px;">সার-ভিত্তিক বিতরণ (রেকর্ড অনুযায়ী)</h3>${scanHtml}</div>
+    <div class="glass-card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:4px;">অডিট CSV ডাউনলোড</h3>
+      <p class="muted" style="margin:0 0 10px;font-size:12.5px;">শুধু এই ডিলারের তথ্য, ব্যাচে পড়া হয়। তারিখ খালি রাখলে শুরু থেকে আজ পর্যন্ত। মোবাইল নম্বর Excel-এ সঠিকভাবে দেখাবে।</p>
+      <div class="filter-bar" style="margin-bottom:10px;">
+        <div class="field"><label>তারিখ থেকে</label><input type="date" data-audit-date="from" value="${esc(a.dateFrom)}" max="${today}"></div>
+        <div class="field"><label>তারিখ পর্যন্ত</label><input type="date" data-audit-date="to" value="${esc(a.dateTo)}" max="${today}"></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-primary btn-sm" data-action="audit-export-daily" ${a.exporting ? 'disabled' : ''}>${ic('export', 'icon-sm')} দৈনিক অডিট CSV</button>
+        <button class="btn btn-outline btn-sm" data-action="audit-export-records" ${a.exporting ? 'disabled' : ''}>${ic('export', 'icon-sm')} বিতরণ রেকর্ড CSV</button>
+        <button class="btn btn-outline btn-sm" data-action="audit-export-ledger" ${a.exporting ? 'disabled' : ''}>${ic('export', 'icon-sm')} স্টক লেজার CSV</button>
+      </div>
+    </div>
+    <div class="glass-card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:8px;">সাম্প্রতিক বিতরণ (সর্বশেষ ৫০টি)</h3>
+      ${recent.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>তারিখ</th><th>বিতরণ আইডি</th></tr></thead><tbody>${recentRows.map((r, i) => `<tr><td>${(rp - 1) * PAGE_SIZE + i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${esc(r.quantity)} কেজি</td><td>${ddmmyyyy(r.date)}</td><td style="font-family:monospace;font-size:12px;">${esc(r.id)}</td></tr>`).join('')}</tbody></table></div>
+        <div class="row-between" style="margin-top:10px;"><span class="muted">পেজ ${rp} / ${Math.max(1, Math.ceil(recent.length / PAGE_SIZE))} (প্রতি পেজে ${PAGE_SIZE})</span><div style="display:flex;gap:6px;"><button class="btn btn-outline btn-sm" data-action="audit-recent-prev" ${rp <= 1 ? 'disabled' : ''}>← আগের</button><button class="btn btn-outline btn-sm" data-action="audit-recent-next" ${rp * PAGE_SIZE >= recent.length ? 'disabled' : ''}>পরের →</button></div></div>`
+        : emptyState('এই ডিলারের কোনো বিতরণ রেকর্ড নেই।')}
+    </div>
+    <div class="glass-card"><h3 style="margin-bottom:8px;">স্টক লেনদেনের ইতিহাস (সাম্প্রতিক ১০০টি)</h3>
+      ${a.ledger.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>তারিখ</th><th>সার</th><th>ধরন</th><th>পরিমাণ</th><th>আগের মজুদ</th><th>নতুন মজুদ</th><th>যিনি করেছেন</th><th>মন্তব্য</th></tr></thead><tbody>${a.ledger.map(r => `<tr><td>${ddmmyyyy(r.date)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${esc(STOCK_TX_TYPES[r.transactionType] || r.transactionType)}</td><td>${ledgerQtyLabel(r)}</td><td>${esc(r.previousStock ?? '-')}</td><td>${esc(r.newStock ?? '-')}</td><td>${esc(r.addedByName || '-')}</td><td>${dashIfEmpty(r.note)}</td></tr>`).join('')}</tbody></table></div>` : emptyState('এখনো কোনো স্টক লেনদেন নেই।')}
+    </div>`;
+}
+// Walks stockHistory/{dealerId} in key (= creation-time) order, from the
+// start of `fromDate` (entries dated D can only be created on or after D),
+// in batches — bounded by this one dealer's own ledger.
+async function iterateDealerLedger(dealerId, fromDate, onRows) {
+  const base = ref(db, `stockHistory/${dealerId}`);
+  const BATCH = 1000;
+  let cursor = null;
+  const startKey = fromDate ? pushKeyPrefixForTime(startOfLocalDayMs(fromDate)) : null;
+  for (;;) {
+    const q = cursor ? query(base, orderByKey(), startAfter(cursor), limitToFirst(BATCH))
+      : startKey ? query(base, orderByKey(), startAt(startKey), limitToFirst(BATCH))
+      : query(base, orderByKey(), limitToFirst(BATCH));
+    const rows = snapToOrderedArray(await get(q));
+    if (!rows.length) break;
+    onRows(rows);
+    if (rows.length < BATCH) break;
+    cursor = rows[rows.length - 1].firebaseKey;
+  }
+}
+async function exportDealerAuditCSV(kind, btn) {
+  const a = state.audit;
+  const d = state.dealers.find(x => x.id === a.dealerId);
+  if (!d || a.exporting) return;
+  const from = a.dateFrom || '', to = a.dateTo || '';
+  if (from && to && from > to) { showToast('"তারিখ থেকে" অবশ্যই "তারিখ পর্যন্ত"-এর আগে হতে হবে', 'error'); return; }
+  const inRange = (dt) => { const s = String(dt || ''); return (!from || s >= from) && (!to || s <= to); };
+  a.exporting = true;
+  const setBtn = (txt) => { const b = document.querySelector(`[data-action="${btn && btn.dataset.action}"]`); if (b) b.textContent = txt; };
+  renderCurrentView(); setBtn('তৈরি হচ্ছে...');
+  const safeName = String(d.name || d.id).replace(/[^\wঀ-৿-]+/g, '_').slice(0, 40);
+  const rangeTag = `${from || 'start'}_${to || todayStr()}`;
+  const dealerCols = [d.name || '', d.id, d.union || ''];
+  const recScope = { kind: 'index', field: 'dealerId', value: d.id, predicate: (from || to) ? (r => inRange(r.date)) : null };
+  try {
+    if (kind === 'records') {
+      const parts = [toCSV(DISTRIBUTION_CSV_HEADERS, [])];
+      let n = 0;
+      await iterateDistScope(recScope, (rows) => { parts.push(new Blob(['\n' + csvLines(buildDistributionCsvRows(rows, n))])); n += rows.length; }, (m) => setBtn(`পড়া হচ্ছে... (${m.toLocaleString('bn-BD')})`));
+      downloadCSV(`dealer_audit_records_${safeName}_${rangeTag}.csv`, parts);
+      showToast(`${n.toLocaleString('bn-BD')} টি রেকর্ড ডাউনলোড হয়েছে`, 'success');
+    } else if (kind === 'ledger') {
+      const lines = [];
+      await iterateDealerLedger(d.id, from, (rows) => {
+        rows.filter(e => inRange(e.date)).forEach(e => lines.push([...dealerCols, csvDate(e.date), fertilizerLabel(e.fertilizer), STOCK_TX_TYPES[e.transactionType] || e.transactionType || '', e.transactionType || '', e.quantity ?? '', e.previousStock ?? '', e.newStock ?? '', e.addedByName || '', e.note || '', e.createdAt ? new Date(e.createdAt).toLocaleString('en-GB') : '', e.id]));
+        setBtn(`পড়া হচ্ছে... (${lines.length.toLocaleString('bn-BD')})`);
+      });
+      downloadCSV(`dealer_audit_stock_ledger_${safeName}_${rangeTag}.csv`, toCSV(['ডিলারের নাম', 'ডিলার আইডি', 'ইউনিয়ন', 'তারিখ', 'সার', 'লেনদেনের ধরন', 'ধরন কোড', 'পরিমাণ (কেজি)', 'আগের মজুদ', 'নতুন মজুদ', 'যিনি করেছেন', 'মন্তব্য', 'তৈরি সময়', 'লেনদেন আইডি'], lines));
+      showToast(`${lines.length.toLocaleString('bn-BD')} টি স্টক লেনদেন ডাউনলোড হয়েছে`, 'success');
+    } else {
+      // Daily audit: one row per (date, fertilizer) with records-based
+      // distribution AND ledger-based received/distributed/adjusted, plus
+      // closing available from the ledger, then period + current totals.
+      const days = new Map();
+      const cell = (date, fert) => {
+        const k = `${date}|${fert}`;
+        if (!days.has(k)) days.set(k, { date, fert, count: 0, kg: 0, received: 0, ledDist: 0, adjusted: 0, closing: null, closingAt: -1 });
+        return days.get(k);
+      };
+      await iterateDistScope(recScope, (rows) => rows.forEach(r => { const c = cell(String(r.date || ''), r.fertilizer); c.count++; c.kg += parseFloat(normalizeBanglaDigits(r.quantity)) || 0; }), (m) => setBtn(`রেকর্ড পড়া হচ্ছে... (${m.toLocaleString('bn-BD')})`));
+      await iterateDealerLedger(d.id, from, (rows) => {
+        rows.filter(e => inRange(e.date)).forEach(e => {
+          const c = cell(String(e.date || ''), e.fertilizer);
+          const q = Number(e.quantity) || 0;
+          if (e.transactionType === 'STOCK_TRANSFER_IN') c.received += q;
+          else if (e.transactionType === 'DISTRIBUTION') c.ledDist += q;
+          else if (e.transactionType === 'STOCK_ADJUSTMENT') c.adjusted += ledgerSignedQty(e);
+          const at = Number(e.createdAt) || 0;
+          if (e.newStock !== undefined && e.newStock !== null && at >= c.closingAt) { c.closing = e.newStock; c.closingAt = at; }
+        });
+        setBtn('স্টক লেজার পড়া হচ্ছে...');
+      });
+      const fertOrder = (f) => { const i = FERTILIZERS.findIndex(x => x.v === f); return i < 0 ? 99 : i; };
+      const list = [...days.values()].sort((x, y) => (x.date === y.date ? fertOrder(x.fert) - fertOrder(y.fert) : (x.date < y.date ? -1 : 1)));
+      const r2 = (v) => Math.round((Number(v) || 0) * 1000) / 1000;
+      const out = list.map(c => [...dealerCols, csvDate(c.date), fertilizerLabel(c.fert), r2(c.received), r2(c.kg), c.count, r2(c.ledDist), r2(c.adjusted), c.closing === null ? '' : c.closing, '']);
+      const sums = {};
+      list.forEach(c => { const s = sums[c.fert] || (sums[c.fert] = { received: 0, kg: 0, count: 0, ledDist: 0, adjusted: 0 }); s.received += c.received; s.kg += c.kg; s.count += c.count; s.ledDist += c.ledDist; s.adjusted += c.adjusted; });
+      out.push([]);
+      Object.keys(sums).sort((x, y) => fertOrder(x) - fertOrder(y)).forEach(f => { const s = sums[f]; out.push([...dealerCols, `সময়কালের মোট (${from ? csvDate(from) : 'শুরু'} – ${csvDate(to || todayStr())})`, fertilizerLabel(f), r2(s.received), r2(s.kg), s.count, r2(s.ledDist), r2(s.adjusted), '', '']); });
+      const stock = (await dbGet(`dealerStock/${d.id}`)) || {};
+      FERTILIZERS.forEach(f => { const s = normalizeStockRow(stock[f.v]); out.push([...dealerCols, `বর্তমান স্টক (${csvDate(todayStr())})`, fertilizerLabel(f.v), r2(s.received), '', '', r2(s.distributed), '', r2(s.available), 'মোট প্রাপ্ত / মোট বিতরণকৃত / বর্তমান মজুদ — dealerStock']); });
+      downloadCSV(`dealer_audit_daily_${safeName}_${rangeTag}.csv`, toCSV(['ডিলারের নাম', 'ডিলার আইডি', 'ইউনিয়ন', 'তারিখ', 'সার', 'প্রাপ্ত/বরাদ্দ (কেজি)', 'বিতরণ (কেজি, রেকর্ড)', 'বিতরণ সংখ্যা (এন্ট্রি)', 'বিতরণ (কেজি, স্টক লেজার)', 'সমন্বয় (± কেজি)', 'দিনশেষে মজুদ (কেজি, লেজার)', 'মন্তব্য'], out));
+      showToast('দৈনিক অডিট CSV ডাউনলোড হয়েছে', 'success');
+    }
+    writeSystemLog('success', 'dealer_audit_export', `${d.name} (${d.id}) — ${kind} — ${from || 'start'} থেকে ${to || todayStr()}`);
+  } catch (e) {
+    showToast('CSV তৈরি করা যায়নি: ' + ((e && e.message) || ''), 'error');
+    writeSystemLog('error', 'dealer_audit_export_failed', `${d.id} ${kind}: ${(e && e.message) || 'unknown'}`);
+  } finally {
+    a.exporting = false;
+    renderCurrentView();
+  }
+}
+
+// The dealer's stock is never typed in here: it changes only by transfer from
+// the central stock, ± adjustment (reason required) or distribution — so the
+// received − distributed = available balance and the ledger always hold.
+function renderEditDealerStockBlock(d, loading) {
+  const stock = state.allDealerStock[d.id] || {};
+  const rows = FERTILIZERS.map(f => {
+    const row = normalizeStockRow(stock[f.v]);
+    const badgeCls = row.available <= 0 ? 'badge-red' : 'badge-green';
+    return `<tr><td>${esc(f.l)}</td><td><span class="badge ${badgeCls}">${row.available.toLocaleString('bn-BD')} কেজি</span></td></tr>`;
+  }).join('');
+  const canTransfer = state.user.role === 'admin' || state.user.role === 'uno';
+  return `
+    <div class="glass-card" style="margin-top:16px;padding:14px;">
+      <div class="row-between" style="margin-bottom:8px;"><h3 style="margin:0;font-size:15px;">বর্তমান স্টক</h3>${loading ? `<span class="muted" style="font-size:12px;">লোড হচ্ছে...</span>` : ''}</div>
+      <div class="table-wrap"><table class="mini-table"><thead><tr><th>সার</th><th>মজুদ আছে</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+        ${canTransfer ? `<button type="button" class="btn btn-outline btn-sm" data-action="open-transfer-stock" data-dealer-id="${d.id}">+ স্টক যোগ করুন</button>` : ''}
+        ${state.user.role === 'admin' ? `<button type="button" class="btn btn-outline btn-sm" data-action="open-stock-adjust" data-target="${d.id}">± সমন্বয় (বাড়ান/কমান)</button>` : ''}
+        <button type="button" class="btn btn-outline btn-sm" data-action="view-stock-history" data-dealer-id="${d.id}">স্টক ইতিহাস দেখুন</button>
+      </div>
+    </div>`;
+}
 function openEditDealerModal(id) {
   const d = state.dealers.find(x => x.id === id);
   if (!d) return;
-  // Load dealer's current stock for display. v10.11: allocation (stock add) is Main Admin only —
-  // other admins get the profile-only form below.
-  (canManageStock() ? dbGet(`dealers/${id}/stock`) : Promise.reject(new Error('profile-only'))).then(stock => {
-    const stockData = stock || {};
-    // (feature) Was: one input per fertilizer holding the FULL new total —
-    // admin had to already know/recalculate the previous number and retype
-    // the whole thing every time. Now: admin only types how much to ADD
-    // (or, with a '-' sign, how much to subtract for a correction) — the
-    // previous stock (shown as read-only reference beside the field) is
-    // kept and added to automatically on submit, in handleEditDealerSubmit().
-    const stockFields = FERTILIZERS.map(f => `
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
-        <label style="min-width:100px;font-weight:600;">${esc(f.v)}</label>
-        <input type="number" name="stockadd_${esc(f.v)}" value="0" step="0.5" style="width:110px;">
-        <span class="muted">কেজি যোগ (কমাতে হলে - দিন)</span>
-        <span class="muted" style="margin-left:auto;">বর্তমান স্টক: <b>${(Number(stockData[f.v]) || 0).toLocaleString('bn-BD')}</b> কেজি</span>
-      </div>`).join('');
-    openModal(`
-      <h3>ডিলার তথ্য পরিবর্তন</h3>
-      <form id="editDealerForm" data-id="${d.id}">
-        <div class="field"><label>ডিলারের নাম</label><input type="text" name="name" value="${esc(d.name)}" required></div>
-        <div class="field"><label>মোবাইল নম্বর</label><input type="tel" name="mobile" value="${esc(d.mobile)}" pattern="01[0-9]{9}" required></div>
-        <div class="field"><label>ইমেইল (পরিবর্তনযোগ্য নয়)</label><input type="email" value="${esc(d.email || '')}" disabled></div>
-        <div class="field"><label>ইউনিয়ন</label><select name="union" required>${UNIONS.map(u => `<option value="${esc(u)}" ${u === d.union ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
-        <div class="field"><label>এলাকার ডিলার</label><input type="text" name="area" value="${esc(d.area || '')}" required></div>
-        <div style="margin:14px 0 8px;font-weight:700;border-top:1px solid var(--border);padding-top:12px;">সার স্টক ব্যবস্থাপনা</div>
-        <p class="muted" style="margin-bottom:10px;font-size:12px;">আগের স্টক এমনিতেই যোগ থাকবে — শুধু কত নতুন স্টক দিচ্ছেন তা লিখুন। কিছু না বদলাতে চাইলে ০ রেখে দিন। মোট স্টক কখনো ঋণাত্মক হবে না।</p>
-        ${stockFields}
-        <button type="submit" class="btn btn-primary" style="width:100%;margin-top:10px;">প্রোফাইল ও স্টক সংরক্ষণ করুন</button>
-      </form>
-    `);
-  }).catch(() => {
-    openModal(`
-      <h3>ডিলার তথ্য পরিবর্তন</h3>
-      <form id="editDealerForm" data-id="${d.id}">
-        <div class="field"><label>ডিলারের নাম</label><input type="text" name="name" value="${esc(d.name)}" required></div>
-        <div class="field"><label>মোবাইল নম্বর</label><input type="tel" name="mobile" value="${esc(d.mobile)}" pattern="01[0-9]{9}" required></div>
-        <div class="field"><label>ইমেইল (পরিবর্তনযোগ্য নয়)</label><input type="email" value="${esc(d.email || '')}" disabled></div>
-        <div class="field"><label>ইউনিয়ন</label><select name="union" required>${UNIONS.map(u => `<option value="${esc(u)}" ${u === d.union ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
-        <div class="field"><label>এলাকার ডিলার</label><input type="text" name="area" value="${esc(d.area || '')}" required></div>
-        <button type="submit" class="btn btn-primary" style="width:100%;">সংরক্ষণ করুন</button>
-      </form>
-    `);
-  });
+  openModal(`
+    <h3>ডিলার তথ্য পরিবর্তন</h3>
+    <form id="editDealerForm" data-id="${d.id}">
+      <div class="field"><label>ডিলারের নাম</label><input type="text" name="name" value="${esc(d.name)}" required></div>
+      <div class="field"><label>মোবাইল নম্বর</label><input type="tel" name="mobile" value="${esc(d.mobile)}" pattern="01[0-9]{9}" required></div>
+      <div class="field"><label>ইমেইল (পরিবর্তনযোগ্য নয়)</label><input type="email" value="${esc(d.email || '')}" disabled></div>
+      <div class="field"><label>ইউনিয়ন</label><select name="union" required>${UNIONS.map(u => `<option value="${esc(u)}" ${u === d.union ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
+      <div class="field"><label>এলাকার ডিলার</label><input type="text" name="area" value="${esc(d.area || '')}" required></div>
+      <button type="submit" class="btn btn-primary" style="width:100%;">সংরক্ষণ করুন</button>
+    </form>
+    <div id="editDealerStockBlock">${renderEditDealerStockBlock(d, !state.allDealerStock[d.id])}</div>
+  `);
+  dbGet(`dealerStock/${d.id}`).then(row => {
+    state.allDealerStock[d.id] = row || {};
+    const block = document.getElementById('editDealerStockBlock');
+    if (block) block.innerHTML = renderEditDealerStockBlock(d, false);
+  }).catch(() => { /* keep whatever was already shown */ });
 }
 
 async function handleEditDealerSubmit(form) {
@@ -6499,46 +7435,8 @@ async function handleEditDealerSubmit(form) {
     await dbUpdate(`dealers/${id}`, { name, mobile, union, area });
     const idx = state.dealers.findIndex(d => d.id === id);
     state.dealers[idx] = { ...state.dealers[idx], name, mobile, union, area };
-    // (feature) Stock fields are now "কত যোগ করছেন" (amount to add/subtract)
-    // instead of "নতুন মোট স্টক কত" (the full new total) — admin no longer
-    // needs to know/retype the previous number. newStock = previousStock +
-    // enteredDelta, floored at 0 so it can never go negative. Every
-    // fertilizer whose stock actually changed also gets one entry in the
-    // separate append-only `dealerStockHistory` audit table (before/after/
-    // delta/who), purely additive — getDealerCurrentStock() and the
-    // stock-check/deduction logic in performDistributionSave() are
-    // completely untouched by this.
-    const hasStock = canManageStock() && FERTILIZERS.some(f => form.querySelector(`[name="stockadd_${f.v}"]`) !== null);
-    if (hasStock) {
-      const previousStock = (await dbGet(`dealers/${id}/stock`)) || {};
-      const stockUpdate = {};
-      const historyWrites = [];
-      FERTILIZERS.forEach(f => {
-        const input = form.querySelector(`[name="stockadd_${f.v}"]`);
-        const delta = input ? (parseFloat(input.value) || 0) : 0;
-        const before = Number(previousStock[f.v]) || 0;
-        const after = Math.max(0, before + delta);
-        stockUpdate[f.v] = after;
-        if (after !== before) {
-          historyWrites.push(dbPush('dealerStockHistory', {
-            dealerId: id,
-            dealerName: name,
-            fertilizer: f.v,
-            previousStock: before,
-            newStock: after,
-            amountChanged: after - before,
-            changeType: after > before ? 'stock_added' : 'stock_reduced',
-            changedBy: (state.user && (state.user.name || state.user.email || state.user.uid)) || 'unknown',
-            createdAt: Date.now(),
-          }));
-        }
-      });
-      await dbSet(`dealers/${id}/stock`, stockUpdate);
-      if (historyWrites.length) await Promise.all(historyWrites);
-      writeSystemLog('settings', 'dealer_stock_updated', `ডিলার: ${name} | স্টক: ${JSON.stringify(stockUpdate)}`);
-    }
     closeModal();
-    showToast('ডিলার তথ্য ও স্টক সংরক্ষণ হয়েছে', 'success');
+    showToast('ডিলার তথ্য সংরক্ষণ হয়েছে', 'success');
     writeSystemLog('account', 'dealer_updated', `ডিলার তথ্য পরিবর্তন: ${name}`);
     renderCurrentView();
   } catch (e) {
@@ -7632,20 +8530,6 @@ function logBalanceBlockedAttempt(data, blocked) {
   });
   writeSystemLog('data_entry', 'crop_fert_lock_blocked', `কৃষক: ${data.farmerName} | এনআইডি-রেফ: ${nidRef(data.nid)} | ${blocked.map(b => `${b.cropName}/${b.fertilizer}`).join(', ')}`);
 }
-/* dealerSales/{dealerId}/byFert/{fertilizer} — cumulative kg sold (v8-1). Kept
-   with increment() on every save (+) and admin edit/delete/bulk delete (−), so
-   the stock-verification page can show বরাদ্দ = বিক্রি + অবশিষ্ট without ever
-   scanning the distributions table. Admin "বিক্রয় হিসাব সিঙ্ক" rebuilds it. */
-function bumpDealerSales(dealerId, items, sign) {
-  if (!dealerId || !items || !items.length) return Promise.resolve();
-  const byFert = {};
-  items.forEach(it => { if (it.fertilizer) byFert[it.fertilizer] = (byFert[it.fertilizer] || 0) + (parseFloat(it.quantity) || 0) * sign; });
-  const updates = {};
-  Object.entries(byFert).forEach(([f, q]) => { const v = round2(q); if (v) updates[`dealerSales/${dealerId}/byFert/${f}`] = increment(v); });
-  if (!Object.keys(updates).length) return Promise.resolve();
-  return update(ref(db), updates).catch(e => { console.error('[FDMS] dealerSales update failed', e); writeSystemLog('error', 'dealer_sales_update_failed', `${dealerId}: ${(e && e.message) || ''}`); });
-}
-
 async function performDistributionSave() {
   if (isSubmitting || !pendingDistribution) return;
   const { data, items, isBackData, plan } = pendingDistribution;
@@ -7659,12 +8543,12 @@ async function performDistributionSave() {
   const batchId = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   const deducted = []; // [{ fert, qty }] stock already taken out — refunded if the entry fails
   let ledgerWatch = null; // v10.13: keeps the farmer's ledger cached for the save + undo transactions
+  let stockBefore = {};
   const refundStock = async () => {
-    while (deducted.length) {
-      const d = deducted.pop();
-      try { await runTransaction(ref(db, `dealers/${state.user.uid}/stock/${d.fert}`), (current) => round2((Number(current) || 0) + d.qty)); }
-      catch (e) { writeSystemLog('error', 'stock_refund_failed', `${d.fert}: ${d.qty} কেজি — ${(e && e.message) || ''}`); }
-    }
+    if (!deducted.length) return;
+    const back = deducted.splice(0).map(d => ({ fertilizer: d.fert, quantity: d.qty }));
+    try { await restoreDealerStock(state.user.uid, back); }
+    catch (e) { writeSystemLog('error', 'stock_refund_failed', `${back.map(b => `${b.fertilizer}: ${b.quantity}`).join(', ')} কেজি — ${(e && e.message) || ''}`); }
   };
   const undoReservation = async () => {
     if (!ledgerReserved) return;
@@ -7839,28 +8723,22 @@ async function performDistributionSave() {
       plan.txLand = wrote;
     }
 
-    // ---- 2. Dealer stock: one atomic deduction per fertilizer; any shortfall → refund all + release ----
+    // ---- 2. Dealer stock: ONE transaction on dealerStock/{dealer} — every fertilizer of this entry or none ----
     const needByFert = {};
     items.forEach(it => { needByFert[it.fertilizer] = round2((needByFert[it.fertilizer] || 0) + it.quantity); });
-    const short = [];
-    for (const [fert, need] of Object.entries(needByFert)) {
-      const txResult = await runTransaction(ref(db, `dealers/${state.user.uid}/stock/${fert}`), (current) => {
-        const cur = Number(current) || 0;
-        if (need > cur + 1e-9) return; // abort — insufficient at commit time
-        return round2(cur - need);
-      });
-      if (!txResult.committed) { short.push(fert); break; }
-      deducted.push({ fert, qty: need });
-    }
-    if (short.length) {
-      await refundStock();
+    const stockItems = Object.entries(needByFert).map(([fertilizer, quantity]) => ({ fertilizer, quantity }));
+    const reserve = await reserveDealerStock(state.user.uid, stockItems);
+    if (!reserve.committed) {
       await undoReservation();
-      writeSystemLog('error', 'stock_deduct_failed', `${short.join(', ')} — পর্যাপ্ত স্টক ছিল না; পুরো এন্ট্রি বাতিল`);
-      showToast(`পর্যাপ্ত স্টক নেই: ${short.join(', ')} — কোনো সার সংরক্ষণ করা হয়নি`, 'error');
+      const sf = reserve.shortfall;
+      writeSystemLog('error', 'stock_deduct_failed', sf ? `${sf.fertilizer} — পর্যাপ্ত স্টক ছিল না (উপলব্ধ ${sf.available}); পুরো এন্ট্রি বাতিল` : 'ডিলারের স্টক আপডেট করা যায়নি; পুরো এন্ট্রি বাতিল');
+      showToast(sf ? `পর্যাপ্ত স্টক নেই: ${fertilizerLabel(sf.fertilizer)} (উপলব্ধ ${bnNum(sf.available)} কেজি) — কোনো সার সংরক্ষণ করা হয়নি` : 'স্টক আপডেট করা যায়নি — কিছুই সংরক্ষণ হয়নি। ইন্টারনেট সংযোগ চেক করুন।', 'error');
       pendingDistribution = null; closeModal();
       if (plan.nid) handleNidLookup(true);
       return;
     }
+    stockItems.forEach(it => deducted.push({ fert: it.fertilizer, qty: it.quantity }));
+    stockBefore = reserve.before || {};
 
     // ---- 3. All records + every dashboard counter in ONE atomic multi-path write ----
     const createdAt = Date.now();
@@ -7878,12 +8756,24 @@ async function performDistributionSave() {
         entitlementKg: it.limitKg, kgPerBigha: it.perBigha,
         usedBeforeKg: round2(it.usedBeforeKg || 0), remainingAfterKg: round2(Math.max(0, (it.remainingKg || 0) - it.quantity)),
         dealerId: state.user.uid, dealerName: state.user.name, batchId, createdAt, balanceCycle: plan.cycleId,
+        dealerDateKey: `${state.user.uid}_${data.date}`, // exact "this dealer, this day" index (ডিলার অডিট)
         ...actingRecordMeta(), // Dealer View: createdBy/createdByRole/actingAsDealer/actingAdminUid/actingAdminName
       });
       return { id: push(ref(db, 'distributions')).key, ...record };
     });
     const atomic = { ...statsDeltaPaths(newRecords, 1) };
     newRecords.forEach(({ id, ...rec }) => { atomic[`distributions/${id}`] = rec; });
+    // Stock ledger (stockHistory/{dealer}) — one DISTRIBUTION entry per record, in the SAME atomic write.
+    const ledgerPaths = {};
+    const runBal = { ...stockBefore };
+    const actor = realUser();
+    newRecords.forEach(r => {
+      const hk = push(ref(db, `stockHistory/${state.user.uid}`)).key;
+      const prev = round2(Number(runBal[r.fertilizer]) || 0);
+      runBal[r.fertilizer] = round2(prev - r.quantity);
+      ledgerPaths[`stockHistory/${state.user.uid}/${hk}`] = { dealerId: state.user.uid, dealerName: state.user.name || '', fertilizer: r.fertilizer, transactionType: 'DISTRIBUTION', quantity: r.quantity, previousStock: prev, newStock: runBal[r.fertilizer], addedBy: actor.uid, addedByName: actor.name || '', note: `বিতরণ — কৃষক: ${data.farmerName || '-'}`, date: data.date, createdAt, distId: r.id, batchId };
+    });
+    Object.assign(atomic, ledgerPaths);
     if (data.nid) atomic[`dashboardStats/dealerStats/${statsKeyPart(state.user.uid)}/farmers/${data.nid}`] = true;
     const newFarmer = !!(canonicalNid(data.nid) && (nidHistoryCount !== null ? nidHistoryCount === 0 : plan.firstEver));
     if (newFarmer) atomic['dashboardStats/totalFarmers'] = increment(1); // মোট কৃষক = স্বতন্ত্র NID
@@ -7899,6 +8789,7 @@ async function performDistributionSave() {
       if (isPermissionDenied(err)) {
         const recOnly = {};
         newRecords.forEach(({ id, ...rec }) => { recOnly[`distributions/${id}`] = rec; });
+        Object.assign(recOnly, ledgerPaths);
         const flag = { 'dashboardStats/_meta/reconcileRequired': true, 'dashboardStats/_meta/reconcileReason': 'stats_update_failed', 'dashboardStats/_meta/reconcileRequiredAt': Date.now() };
         try { await update(ref(db), { ...recOnly, ...flag }); saved = true; }
         catch (e2) {
@@ -7937,7 +8828,6 @@ async function performDistributionSave() {
       if (newFarmer && state.dashboardStats) state.dashboardStats.totalFarmers = (Number(state.dashboardStats.totalFarmers) || 0) + 1;
     }
     } catch (uiErr) { console.error('[FDMS] local view update after save failed (data is saved)', uiErr); }
-    bumpDealerSales(state.user.uid, newRecords.map(r => ({ fertilizer: r.fertilizer, quantity: r.quantity })), 1);
     upsertFarmerProfile(plan, data);
     if (statsProblem) showToast(`ডেটা সংরক্ষণ হয়েছে, তবে পরিসংখ্যান পুনরায় গণনা প্রয়োজন। (${items.length} টি সার)`, 'warn');
     else showToast(`সফলভাবে সংরক্ষণ করা হয়েছে (${items.length} টি সার)`, 'success');
@@ -7987,7 +8877,7 @@ function renderDealerDashboard() {
   const farmers = farmerKeysOf(dealerStats.farmers).size;
   const totalDistributions = Number(dealerStats.totalDistributions) || 0;
   const totalKg = Number(dealerStats.totalFertilizer) || 0;
-  const sales = dd.sales || null;
+  const sales = state.myStock ? Object.fromEntries(FERTILIZERS.map(f => [f.v, normalizeStockRow(state.myStock[f.v]).distributed])) : null;
   const stat = (value, label, color) => `
       <div class="glass-card" style="text-align:center;padding:18px 12px;">
         <div style="font-size:24px;font-weight:800;color:${color || 'var(--primary)'};">${value}</div>
@@ -8366,7 +9256,7 @@ async function handleAdminEditDistSubmit(form) {
   const landChanged = newLand !== null && (oldLand === null || Math.abs(newLand - oldLand) > 0.0005);
   const diff = round2(newQty - oldQty); // positive = more stock needed, negative = stock returns
   if (diff > 0) {
-    const dealerStock = Number((await dbGet(`dealers/${dealerId}/stock/${fertilizer}`))) || 0;
+    const dealerStock = normalizeStockRow(await dbGet(`dealerStock/${dealerId}/${fertilizer}`)).available;
     if (diff > dealerStock) { showToast(`${msgDealerStock(fertilizerLabel(fertilizer), dealerStock)} — প্রয়োজন ${bnNum(diff)} KG অতিরিক্ত।`, 'error'); return; }
     // v10.11: an increase must also fit the farmer's crop-wise balance (same engine as the dealer form).
     const ck = form.dataset.cropKey || '';
@@ -8410,7 +9300,17 @@ async function handleAdminEditDistSubmit(form) {
       upd[`farmerProfiles/${nid}/updatedAt`] = now;
       if (newLand !== null) upd[`farmerProfiles/${nid}/lastLandTotalBigha`] = newLand;
     }
-    await update(ref(db), upd);
+    // More kg → reserve it from the dealer's stock FIRST (all-or-nothing); the record write follows.
+    let editReserve = null;
+    if (diff > 0) {
+      editReserve = await reserveDealerStock(dealerId, [{ fertilizer, quantity: diff }]);
+      if (!editReserve.committed) throw new Error(editReserve.shortfall ? msgDealerStock(fertilizerLabel(fertilizer), editReserve.shortfall.available) : 'ডিলারের স্টক আপডেট করা যায়নি');
+    }
+    try { await update(ref(db), upd); }
+    catch (eUpd) {
+      if (editReserve) { try { await restoreDealerStock(dealerId, [{ fertilizer, quantity: diff }]); } catch (e2) { writeSystemLog('error', 'stock_refund_failed', `edit ${id}: ${(e2 && e2.message) || ''}`); } }
+      throw eUpd;
+    }
     // Season land on the ledger (Main Admin may raise or lower it).
     if (nid && landChanged) {
       await runTransaction(ref(db, `farmerLedger/${cycleId}/${nid}`), cur => {
@@ -8418,9 +9318,16 @@ async function handleAdminEditDistSubmit(form) {
         return { ...base, landTotalBigha: newLand, landChange: null, landEditedAt: now, landEditedBy: state.user.name || '', landEditedByUid: state.user.uid, farmerName: ident.farmerName, updatedAt: now };
       });
     }
-    if (diff) await runTransaction(ref(db, `dealers/${dealerId}/stock/${fertilizer}`), (current) => Math.max(0, (Number(current) || 0) - diff));
+    if (diff < 0) await restoreDealerStock(dealerId, [{ fertilizer, quantity: -diff }]);
+    if (diff) {
+      try {
+        const dName = ((state.dealers || []).find(x => x.id === dealerId) || {}).name || (orig && orig.dealerName) || '';
+        let prevS = editReserve ? Number(editReserve.before[fertilizer]) || 0 : 0, newS = prevS - diff;
+        if (!editReserve) { newS = normalizeStockRow(await dbGet(`dealerStock/${dealerId}/${fertilizer}`)).available; prevS = round2(newS + diff); }
+        await recordStockHistory(dealerId, { dealerName: dName, fertilizer, transactionType: diff > 0 ? 'DISTRIBUTION' : 'STOCK_ADJUSTMENT', quantity: Math.abs(diff), previousStock: round2(prevS), newStock: round2(newS), note: `রেকর্ড এডিট (${id}) — পরিমাণ ${oldQty} → ${newQty} কেজি`, date: todayStr(), distId: id });
+      } catch (e3) { writeSystemLog('error', 'stock_history_failed', `edit ${id}: ${(e3 && e3.message) || ''}`); }
+    }
     if (nid && diff) await adjustFarmerLedgerUsed(cycleId, nid, fertilizer, diff, { cropKey: form.dataset.cropKey || '', takeKey: form.dataset.takeKey || '', setQty: newQty });
-    if (diff) await bumpDealerSales(dealerId, [{ fertilizer, quantity: diff }], 1);
     closeModal();
     showToast(`পরিবর্তন সংরক্ষণ হয়েছে${others ? ` (এই কৃষকের আরও ${bnInt(others)}টি রেকর্ড হালনাগাদ)` : ''}`, 'success');
     if (diff) getAccurateDashboardStats({ force: true }); // kg counters changed → re-read the stored aggregate
@@ -8485,7 +9392,6 @@ async function handleAdminDeleteDist(id) {
     await restoreDealerStockForDeletedRecord(r);
     // give the quantity back to the farmer's ledger summary and release this record's (crop, fertilizer) lock.
     if (r.nid) await adjustFarmerLedgerUsed(recordCycleId(r), r.nid, r.fertilizer, -(Number(r.quantity) || 0), { releaseLock: true, cropKey: r.forCropKey || '', takeKey: recordTakeKey(r) });
-    await bumpDealerSales(r.dealerId, [r], -1);
     writeSystemLog('data_entry', 'distribution_deleted', `ID: ${id} | কৃষক: ${r.farmerName} | ${r.fertilizer}: ${r.quantity}কেজি | দ্বারা: ${ROLE_LABELS[state.user.role] || state.user.role} | স্টক পুনরুদ্ধার করা হয়েছে${flagged ? ` | পরিসংখ্যান পুনর্গণনা চিহ্নিত (${flagged})` : ''}`);
     showToast(flagged ? 'বিতরণ রেকর্ড মুছে গেছে — ড্যাশবোর্ডের সংখ্যা যাচাই প্রয়োজন (সেটিংস → পরিসংখ্যান গণনা করুন)' : 'বিতরণ রেকর্ড মুছে গেছে এবং স্টক ও কৃষকের ব্যালান্স পুনরুদ্ধার হয়েছে', flagged ? 'info' : 'success');
     // Re-read + validate the stored numbers (v10.13c: never an automatic recount).
@@ -9618,7 +10524,8 @@ function csvPhone(v) {
   return s ? `="${s.replaceAll('"', '""')}"` : '';
 }
 function downloadCSV(filename, csvContent) {
-  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const parts = Array.isArray(csvContent) ? csvContent : [csvContent];
+  const blob = new Blob(parts, { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename;
@@ -9712,7 +10619,8 @@ async function loadSaaoData() {
   const uid = state.user.id;
   let ids = [];
   try { ids = Object.keys((await dbGet(`saaoDealers/${uid}`)) || {}); } catch (e) { ids = []; console.error('[FDMS] saaoDealers read failed', e); }
-  const dealers = await Promise.all(ids.map(id => dbGet(`dealers/${id}`).then(d => (d ? { ...d, id, firebaseKey: id } : null)).catch(() => null)));
+  const dealers = await Promise.all(ids.map(id => Promise.all([dbGet(`dealers/${id}`), dbGet(`dealerStock/${id}`).catch(() => null)])
+    .then(([d, st]) => (d ? { ...d, id, firebaseKey: id, stock: Object.fromEntries(FERTILIZERS.map(f => [f.v, normalizeStockRow((st || {})[f.v]).available])) } : null)).catch(() => null)));
   // Double-check the dealer side of the assignment too (stale saaoDealers entries are ignored).
   state.saaoDealers = dealers.filter(d => d && (!d.saaoId || d.saaoId === uid)).sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'bn'));
   state.dealers = state.saaoDealers;
@@ -10017,61 +10925,6 @@ function renderSaaoDuplicates() {
     <p class="muted" style="margin:-4px 0 10px;">নির্বাচিত ডিলারের সর্বশেষ ৩০০টি ডুপ্লিকেট চেষ্টা (সবচেয়ে নতুন আগে)।</p>
     <div class="glass-card">${body}</div>` : ''}
   `;
-}
-/* ---- Main Admin: dealer-sales (মোট বিতরণ per fertilizer) sync — used by বরাদ্দ ---- */
-const salesSync = { running: false, done: 0, total: 0, current: '', errors: [], cancel: false };
-async function loadDealerSalesMeta() {
-  try { state.dealerSalesMeta = (await dbGet('dealerSales')) || {}; } catch (e) { state.dealerSalesMeta = null; }
-  if (currentView === 'allocation') renderCurrentView();
-}
-function renderSalesSyncCard() {
-  const meta = state.dealerSalesMeta;
-  const unsynced = meta ? (state.dealers || []).filter(d => !(meta[d.id] && meta[d.id].syncedAt)).length : null;
-  return `
-    <div class="glass-card" style="margin-bottom:12px;max-width:760px;">
-      <div class="row-between" style="gap:10px;flex-wrap:wrap;">
-        <div><div style="font-weight:700;">ডিলারের বিক্রয় হিসাব (বরাদ্দ/বিক্রি)</div>
-          <div class="muted">নতুন প্রতিটি বিতরণে বিক্রয় হিসাব নিজে থেকে হালনাগাদ হয়। পুরাতন রেকর্ড যুক্ত করতে একবার সিঙ্ক চালান (প্রতি ডিলারের রেকর্ড ১০০০টি করে পড়ে যোগ করে — কম ব্যস্ত সময়ে চালান)।${unsynced !== null ? ` সিঙ্ক বাকি: <b>${unsynced}</b> জন ডিলার।` : ''}</div></div>
-        ${salesSync.running
-          ? `<button class="btn btn-outline btn-sm" data-action="sales-sync-cancel">বাতিল করুন</button>`
-          : `<button class="btn btn-primary btn-sm" data-action="sales-sync-all">${ic('history', 'icon-sm')} সব ডিলারের বিক্রয় হিসাব সিঙ্ক</button>`}
-      </div>
-      ${salesSync.running || salesSync.total ? `<div class="muted" style="margin-top:8px;">${salesSync.running ? 'চলছে' : 'সম্পন্ন'}: ${salesSync.done}/${salesSync.total} ডিলার${salesSync.current ? ` — ${esc(salesSync.current)}` : ''}${salesSync.errors.length ? ` · ত্রুটি: ${salesSync.errors.slice(-2).map(esc).join(' | ')}` : ''}</div>` : ''}
-    </div>`;
-}
-async function syncDealerSales() {
-  if (salesSync.running || !state.user || state.user.role !== 'admin') return;
-  if (!confirm('সব ডিলারের বিক্রয় হিসাব তাদের বিতরণ রেকর্ড থেকে নতুন করে গণনা করা হবে। ডিলার বেশি হলে কিছু সময় লাগবে। চালাবেন?')) return;
-  const list = (state.dealers || []).slice();
-  Object.assign(salesSync, { running: true, done: 0, total: list.length, current: '', errors: [], cancel: false });
-  renderCurrentView();
-  writeSystemLog('settings', 'dealer_sales_sync_started', `${list.length} জন ডিলার`);
-  const base = ref(db, 'distributions');
-  for (const d of list) {
-    if (salesSync.cancel) break;
-    salesSync.current = d.name || d.id; renderCurrentView();
-    try {
-      const byFert = {};
-      let lastKey = null, safety = 0;
-      while (true) {
-        const q = lastKey ? query(base, orderByChild('dealerId'), startAfter(d.id, lastKey), endAt(d.id), limitToFirst(1000))
-                          : query(base, orderByChild('dealerId'), equalTo(d.id), limitToFirst(1000));
-        const batch = snapToOrderedArray(await get(q));
-        batch.forEach(r => { if (r.fertilizer) byFert[r.fertilizer] = round2((byFert[r.fertilizer] || 0) + (parseFloat(r.quantity) || 0)); });
-        if (batch.length < 1000) break;
-        lastKey = batch[batch.length - 1].id;
-        if (++safety > 1000) break;
-      }
-      await dbSet(`dealerSales/${d.id}`, { byFert, syncedAt: Date.now(), syncedBy: state.user.uid });
-    } catch (e) {
-      salesSync.errors.push(`${d.name || d.id}: ${(e && e.message) || ''}`);
-    }
-    salesSync.done++;
-  }
-  salesSync.running = false; salesSync.current = '';
-  writeSystemLog('settings', 'dealer_sales_sync_finished', `${salesSync.done}/${salesSync.total} | ত্রুটি: ${salesSync.errors.length}`);
-  showToast(salesSync.errors.length ? `সিঙ্ক শেষ — ${salesSync.errors.length} টি ত্রুটি` : 'সব ডিলারের বিক্রয় হিসাব সিঙ্ক হয়েছে', salesSync.errors.length ? 'warn' : 'success');
-  await loadDealerSalesMeta();
 }
 /* ---- Main Admin: farmer balance settings (season reset + per-farmer reset) ---- */
 function renderAdminLedgerResult(lk) {
@@ -10737,12 +11590,27 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     case 'export-distributions': await exportDistributionsCSV(); break;
     case 'export-day-csv': await exportDayDistributionsCSV(); break;
     case 'export-dealers': exportDealersCSV(); break;
-    case 'export-allocation': exportAllocationCSV(); break;
-    case 'stock-adjust-open': await openStockAdjustModal(target.dataset.id, target.dataset.fert); break;
     case 'farmer-edit-open': await openFarmerEditModal(target.dataset.nid); break;
-    case 'stock-report-build': await buildStockReport(); break;
-    case 'stock-report-csv': await exportStockReportCSV(); break;
-    case 'export-today-sales': await exportTodaySalesCSV(); break;
+    // ---- two-level stock + dealer audit (FDMS Bakshiganj) ----
+    case 'open-transfer-stock': openTransferStockModal(target.dataset.dealerId || null); break;
+    case 'open-stock-adjust': await openStockAdjustModal(target.dataset.target); break;
+    case 'view-central-stock-history': await openCentralStockHistoryModal(); break;
+    case 'open-receive-central-stock': openReceiveCentralStockModal(); break;
+    case 'view-stock-history': openStockHistoryModal(target.dataset.dealerId); break;
+    case 'open-dealer-audit': openDealerAudit(target.dataset.id); break;
+    case 'audit-scan-records': await runDealerAuditRecordScan(); break;
+    case 'audit-export-daily': await exportDealerAuditCSV('daily', target); break;
+    case 'audit-export-records': await exportDealerAuditCSV('records', target); break;
+    case 'audit-export-ledger': await exportDealerAuditCSV('ledger', target); break;
+    case 'audit-recent-prev': state.audit.recentPage = Math.max(1, state.audit.recentPage - 1); renderCurrentView(); break;
+    case 'audit-recent-next': state.audit.recentPage += 1; renderCurrentView(); break;
+    case 'audit-reload': if (state.audit.dealerId) await loadDealerAudit(state.audit.dealerId); break;
+    case 'audit-view-all-records': {
+      const d = state.dealers.find(x => x.id === state.audit.dealerId);
+      navigateTo('distributions');
+      if (d) { state.filters.union = d.union || ''; state.filters.dealer = d.id; await resetDistScope(); }
+      break;
+    }
     case 'export-duplicates': exportDuplicatesCSV(); break;
     case 'export-report': if (!statsShowable()) { showToast('পরিসংখ্যান লোড হলে এক্সপোর্ট করুন', 'info'); break; } exportReportCSV(); break;
     case 'set-report-type': state.reportType = target.dataset.type; winReset('report'); renderCurrentView(); break;
@@ -10788,11 +11656,9 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     case 'toggle-admin-status': await handleToggleAdminStatus(target.dataset.id); break;
     case 'reset-admin-password': await handleSendAdminPasswordReset(target.dataset.id); break;
     // ---- admin deletes / dealer sales sync ----
-    case 'sales-sync-all': await syncDealerSales(); break;
     case 'or-refresh': loadOfficeReport(true); break;
     case 'or-csv': officeReportCSV(); break;
     case 'or-print': officeReportPrint(); break;
-    case 'sales-sync-cancel': salesSync.cancel = true; showToast('বর্তমান ডিলার শেষ হলে সিঙ্ক থামবে', 'info'); break;
     case 'toggle-backdata-enabled': await handleToggleBackDataEnabled(target.dataset.id); break;
     case 'nid-scan-open': await openNidScanModal(); break;
     case 'nid-scan-clear': clearNidCapture(); break;
@@ -10829,15 +11695,24 @@ document.getElementById('mainApp').addEventListener('change', (e) => {
     if (e.target.id === 'orDealer') O.dealer = e.target.value;
     renderCurrentView(); orLoadLifetime(false); return;
   }
-  if (currentView === 'allocation' && (e.target.id === 'allocUnionFilter' || e.target.id === 'stockRepDate' || e.target.id === 'stockRepUnion' || e.target.id === 'stockRepDealer')) {
-    if (e.target.id === 'allocUnionFilter') { state.allocationUnion = e.target.value; winReset('alloc'); }
-    else {
-      const R = state.stockReport || (state.stockReport = emptyStockReport());
-      if (e.target.id === 'stockRepDate') R.date = e.target.value;
-      if (e.target.id === 'stockRepUnion') { R.union = e.target.value; R.dealer = ''; }
-      if (e.target.id === 'stockRepDealer') R.dealer = e.target.value;
-      winReset('stockrep');
-    }
+  if (e.target.dataset && e.target.dataset.auditUnion !== undefined) {
+    state.audit = { ...emptyAuditState(), unionFilter: e.target.value };
+    renderCurrentView();
+    return;
+  }
+  if (e.target.dataset && e.target.dataset.auditDealer !== undefined) {
+    const union = state.audit.unionFilter;
+    state.audit = { ...emptyAuditState(), unionFilter: union, dealerId: e.target.value };
+    renderCurrentView();
+    if (e.target.value) loadDealerAudit(e.target.value);
+    return;
+  }
+  if (e.target.dataset && e.target.dataset.auditDate) {
+    if (e.target.dataset.auditDate === 'from') state.audit.dateFrom = e.target.value; else state.audit.dateTo = e.target.value;
+    return;
+  }
+  if (e.target.dataset && e.target.dataset.stockSearch !== undefined) {
+    state.stockSearch = e.target.value;
     renderCurrentView();
     return;
   }
@@ -10973,26 +11848,10 @@ document.getElementById('mainApp').addEventListener('input', (e) => {
     }, 300);
     return;
   }
-  if (e.target.id === 'allocationSearchInput' && currentView === 'allocation') {
-    clearTimeout(e.target._searchTimer);
-    const input = e.target;
-    const pos = input.selectionStart;
-    e.target._searchTimer = setTimeout(() => {
-      state.allocationSearch = input.value;
-      winReset('alloc');
-      renderCurrentView();
-      const again = document.getElementById('allocationSearchInput');
-      if (again) { again.focus(); again.setSelectionRange(pos, pos); }
-    }, 250);
-  }
+
 });
 document.getElementById('modalRoot').addEventListener('input', (e) => {
-  if (e.target.name === 'newStock' && e.target.form && e.target.form.id === 'stockAdjustForm') {
-    const prev = Number(e.target.form.dataset.prev) || 0;
-    const v = parseFloat(normalizeBanglaDigits(e.target.value));
-    const el = document.getElementById('stockAdjustDiff');
-    if (el) el.textContent = isNaN(v) ? 'পরিবর্তন: —' : `পরিবর্তন: ${v - prev > 0 ? '+' : ''}${kgFmt(round2(v - prev))} কেজি`;
-  }
+  if (e.target.form && e.target.form.id === 'stockAdjustForm') updateStockAdjustPreview();
 });
 document.getElementById('modalRoot').addEventListener('click', async (e) => {
   if (e.target.closest('[data-action="close-modal"]')) { pendingDistribution = null; closeModal(); return; }
@@ -11016,6 +11875,9 @@ document.getElementById('modalRoot').addEventListener('click', async (e) => {
   if (!act) return;
   if (act.dataset.action === 'modal-navigate') { closeModal(); navigateTo(act.dataset.view); return; }
   if (act.dataset.action === 'farmer-edit-open') { await openFarmerEditModal(act.dataset.nid); return; }
+  if (act.dataset.action === 'open-transfer-stock') { openTransferStockModal(act.dataset.dealerId || null); return; }
+  if (act.dataset.action === 'view-stock-history') { openStockHistoryModal(act.dataset.dealerId); return; }
+  if (act.dataset.action === 'open-stock-adjust') { await openStockAdjustModal(act.dataset.target); return; }
   if (act.dataset.action === 'farmer-add-via-dv') { await addFertilizerViaDealerView(act.dataset.dealer, act.dataset.nid); return; }
   if (act.dataset.action === 'nid-scan-capture') { await captureNidFromVideo(); return; }
   if (act.dataset.action === 'nid-verify') { await handleNidVerify(act); return; } // forward detail (modal)
@@ -11031,6 +11893,9 @@ document.getElementById('modalRoot').addEventListener('click', async (e) => {
   if (act.dataset.action === 'fwd-mark-seen') { await markForwardSeen(act.dataset.id); return; }
 });
 document.getElementById('modalRoot').addEventListener('change', async (e) => {
+  if (e.target.form && e.target.form.id === 'stockAdjustForm') { updateStockAdjustPreview(); return; }
+  if (e.target.form && e.target.form.id === 'transferStockForm') { updateTransferStockCurrentInfo(); return; }
+  if (e.target.form && e.target.form.id === 'receiveCentralStockForm') { updateReceiveCentralStockCurrentInfo(); return; }
   if (e.target.id === 'nidScanFile' && e.target.files && e.target.files[0]) { const f = e.target.files[0]; e.target.value = ''; await captureNidFromFile(f); }
 });
 document.getElementById('modalRoot').addEventListener('submit', async (e) => {
@@ -11038,6 +11903,8 @@ document.getElementById('modalRoot').addEventListener('submit', async (e) => {
   if (e.target.id === 'farmerEditForm') { await handleFarmerEditSubmit(e.target); return; }
   if (e.target.id === 'stockAdjustForm') { await handleStockAdjustSubmit(e.target); return; }
   if (e.target.id === 'forwardForm') { await handleForwardSubmit(e.target); return; }
+  if (e.target.id === 'transferStockForm') { await handleTransferStockSubmit(e.target); return; }
+  if (e.target.id === 'receiveCentralStockForm') { await handleReceiveCentralStockSubmit(e.target); return; }
   if (e.target.id === 'forwardReplyForm') { await handleForwardReplySubmit(e.target); return; }
   const id = e.target.id;
   if (id === 'editDealerForm') await handleEditDealerSubmit(e.target);
